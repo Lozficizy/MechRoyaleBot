@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-ApexMech v28.0 - The Architect (mechfight/1)
-Complete architectural rebuild combining 4 high-elo pillars:
-1. Precomputed 18m Grid + Capped A* Pathfinding (routes cleanly around buildings)
-2. Early-Game Cube-Vacuum Snowball (stacks stats before taking fair 1v1s)
-3. Laser + Gun Corner-Peeking (charges behind cover, peeks to fire, ducks back)
-4. Third-Party Vulture Mode (waits on 2+ brawling bots, snipes low-HP kills)
+ApexMech v29.0 - Cowardly Corner-Peeker (mechfight/1)
+- Third-party logic removed (built for 1v15 swarm)
+- Hard FLEE mode: breaks LOS behind buildings if 2+ enemies <90m, HP <60%, or rushed <48m
+- Strict Laser + Gun corner-peeking at 105m+ (only peeks when Laser is charged)
+- Precomputed 18m Grid + Capped A* Pathfinding + Extended Cube Snowball
 Standard library only. (<4ms/tick)
 """
 import heapq
@@ -15,17 +14,18 @@ import os
 import random
 import mechfight as mf
 
-# ---------------- ARCHITECTURE TUNING ----------------
-SNOWBALL_TIME_S = 70.0      # prioritize cubes/NPCs/crates/drops early
-SNOWBALL_CUBES = 10         # exit early farm mode once we hit this many cubes
-THIRD_PARTY_DIST = 55.0     # two enemies within 55m of each other = brawling
-VULTURE_EXEC_HP = 480.0     # snipe/commit threshold during a third-party
+# ---------------- COWARDLY TUNING ----------------
+SNOWBALL_TIME_S = 100.0     # farm cubes/NPCs/crates/drops early to stat-check
+SNOWBALL_CUBES = 14
+FLEE_HP_FRAC = 0.60         # flee & break LOS below 60% HP if threatened
+FLEE_RUSH_DIST = 48.0       # any enemy closer than 48m triggers immediate kite/flee
+KITE_IDEAL_DIST = 105.0     # long-range poke distance
 LASER_DODGE = True
 AVOID_MORTAR = True
 DROP_HOLD = True
 LOGGING = True
 DEBUG_DRAW = True
-# -----------------------------------------------------
+# -------------------------------------------------
 
 TWO_PI = 6.283185307179586
 DIRS_12 = tuple((math.cos(i * (TWO_PI / 12.0)), math.sin(i * (TWO_PI / 12.0))) for i in range(12))
@@ -69,7 +69,7 @@ def point_in_ring(x: float, y: float, ring) -> bool:
 
 
 class ArenaMap:
-    """Spatial-grid collision + LOS + 18m A* navigation grid + Corner-Peek finder."""
+    """Spatial-grid collision + LOS + 18m A* navigation grid + Cover/Peek finder."""
 
     def __init__(self, map_dir: str):
         self.cell_size = 45.0
@@ -77,7 +77,6 @@ class ArenaMap:
         self.prisms: list[tuple] = []
         self.bounds = (-508.0, 551.0, -329.0, 384.0)
 
-        # Navigation grid for A*
         self.nav_step = 18.0
         self.nav_blocked: set[tuple[int, int]] = set()
 
@@ -123,7 +122,6 @@ class ArenaMap:
                 mf.log(f"[map] load error: {e}")
 
     def _build_nav_grid(self):
-        """One-time startup precomputation of ground-level blocked cells for A*."""
         minx, maxx, miny, maxy = self.bounds
         step = self.nav_step
         gx0 = int(math.floor(minx / step))
@@ -190,14 +188,12 @@ class ArenaMap:
         return True
 
     def find_path_waypoint(self, pos, goal_xy, max_nodes: int = 140):
-        """Fast capped A* on the 18m grid; returns the next world (x, y) waypoint."""
         step = self.nav_step
         sx, sy = int(math.floor(pos[0] / step)), int(math.floor(pos[1] / step))
         gx, gy = int(math.floor(goal_xy[0] / step)), int(math.floor(goal_xy[1] / step))
         if (sx, sy) == (gx, gy):
             return goal_xy
 
-        # If goal cell is slightly inside a building edge, still allow reaching it
         start = (sx, sy)
         goal = (gx, gy)
         open_h = [(0.0, start)]
@@ -234,7 +230,6 @@ class ArenaMap:
                     heapq.heappush(open_h, (ng + h * 1.15, nxt))
                     came_from[nxt] = cur
 
-        # Reconstruct path and pick the 2nd step ahead for smooth steering
         node = best_node
         path = []
         while node in came_from:
@@ -246,15 +241,50 @@ class ArenaMap:
         pick = path[min(1, len(path) - 1)]
         return ((pick[0] + 0.5) * step, (pick[1] + 0.5) * step)
 
+    def find_flee_point(self, pos, muzzle_h: float, threats, zc, zr: float, prev_dir):
+        """Pure cowardly evasion: break LOS from ALL threats, maximize distance, stay in zone."""
+        x, y, z = pos[0], pos[1], pos[2]
+        zx, zy = zc[0], zc[1]
+        safe_r = max(zr - 12.0, 8.0)
+
+        best_score = -1e9
+        best_dir = None
+
+        for ca, sa in DIRS_12:
+            if self.is_blocked_body(x + ca * 5.0, y + sa * 5.0, z):
+                continue
+            nx, ny = x + ca * 15.0, y + sa * 15.0
+            if self.is_blocked_body(nx, ny, z):
+                continue
+            cm = (nx, ny, z + muzzle_h)
+            score = 0.0
+
+            for e in threats[:5]:
+                ep = e["pos"]
+                old_d = math.hypot(x - ep[0], y - ep[1])
+                new_d = math.hypot(nx - ep[0], ny - ep[1])
+                if new_d < 180.0:
+                    if self.has_los(cm, (ep[0], ep[1], ep[2] + 4.5), max_steps=7):
+                        score -= 80.0 + max(0.0, 95.0 - new_d) * 0.9
+                    else:
+                        score += 55.0
+                score += clamp(new_d - old_d, -12.0, 15.0) * 2.0
+
+            dz = math.hypot(nx - zx, ny - zy)
+            if dz > safe_r:
+                score -= (dz - safe_r) * 3.5
+
+            if prev_dir is not None and (ca * prev_dir[0] + sa * prev_dir[1]) > 0.65:
+                score += 18.0
+
+            if score > best_score:
+                best_score = score
+                best_dir = (ca, sa)
+
+        return best_dir
+
     def find_cover_and_peek(self, pos, muzzle_h: float, target, secondaries, want_peek: bool, zc, zr: float):
-        """
-        Corner-Peeking Engine:
-        Samples 12 directions at 10m and 18m around `pos`.
-        - If `want_peek` is True (Laser charged / ready to shoot): picks a spot with LOS to `target`
-          while minimizing LOS from `secondaries`.
-        - If `want_peek` is False (Laser charging or on cooldown): picks a Hidden spot with NO LOS
-          to `target` (or `secondaries`) that stays close to the corner so we can peek next tick.
-        """
+        """Corner-Peeking: stays hidden behind walls while charging, peeks only to fire."""
         x, y, z = pos[0], pos[1], pos[2]
         tp = target["pos"]
         t_aim = (tp[0], tp[1], tp[2] + 4.5)
@@ -271,34 +301,27 @@ class ArenaMap:
                     continue
                 cm = (nx, ny, z + muzzle_h)
                 sees_t = self.has_los(cm, t_aim, max_steps=8)
+                td = math.hypot(nx - tp[0], ny - tp[1])
                 score = 0.0
 
                 if want_peek:
-                    if sees_t:
-                        score += 90.0
-                    else:
-                        score -= 70.0
+                    score += 85.0 if sees_t else -70.0
                 else:
-                    # Charging behind cover: strongly prefer NO LOS to target
-                    if not sees_t:
-                        score += 95.0
-                    else:
-                        score -= 80.0
+                    score += 110.0 if not sees_t else -95.0
 
-                # Prefer closer step (10m) so corner-peeking is snappy
-                score -= rad * 1.1
+                # Reward keeping safe distance from primary target
+                score -= abs(td - KITE_IDEAL_DIST) * 0.45
+                score -= rad * 0.9
 
-                # Penalize exposure to secondary enemies
                 for se in secondaries[:3]:
                     sp = se["pos"]
                     sd = math.hypot(nx - sp[0], ny - sp[1])
-                    if sd < 150.0:
+                    if sd < 160.0:
                         if self.has_los(cm, (sp[0], sp[1], sp[2] + 4.5), max_steps=6):
-                            score -= 75.0 + max(0.0, 65.0 - sd) * 0.6
+                            score -= 90.0 + max(0.0, 75.0 - sd) * 0.8
                         else:
-                            score += 25.0
+                            score += 35.0
 
-                # Zone safety
                 dz = math.hypot(nx - zx, ny - zy)
                 if dz > safe_r:
                     score -= (dz - safe_r) * 3.0
@@ -324,7 +347,7 @@ class ArenaMap:
 
 
 class Bot:
-    name = "ApexMech-v28.0"
+    name = "ApexMech-v29.0"
 
     def __init__(self, hello: mf.Hello):
         self.slot = hello["slot"]
@@ -333,35 +356,38 @@ class Bot:
         self.map = ArenaMap(hello["map"]["dir"])
         self.pickup_r = self.config.get("loot", {}).get("pickup_radius", 4.0)
 
-        # Corner-Peeker + Third-Party Meta: Laser + Gun primary, Lightning backup
+        # Long-range poke loadout: Laser + Gun
         self.weapon_rank = {"laser": 5, "gun": 4, "lightning": 3, "mortar": 1}
+        # Survival & mobility first
         self.upgrade_weights = {
             "armor": 100,
-            "laser": 99,
-            "hp": 97,
-            "gun_rate": 96,
-            "gun_damage": 95,
-            "speed": 94,
-            "regen": 92,
-            "reload": 90,
-            "boost": 88,
-            "energy": 87,
-            "lightning": 85,
-            "sensors": 70,
-            "mortar": 25,
+            "hp": 99,
+            "speed": 98,
+            "regen": 97,
+            "boost": 96,
+            "energy": 95,
+            "laser": 94,
+            "gun_damage": 91,
+            "gun_rate": 90,
+            "reload": 88,
+            "lightning": 80,
+            "sensors": 75,
+            "mortar": 20,
         }
 
         self.last_pos = None
         self.stuck_ticks = 0
         self.strafe_dir = 1.0
         self.strafe_timer = 0
-        self.strafe_period = 7
+        self.strafe_period = 6
         self.last_damage_bearing = None
         self.last_damage_t = -10.0
         self.roam_target = None
         self.locked_id = None
 
-        # A* cache
+        self.flee_until = 0.0
+        self.prev_flee_dir = None
+
         self.path_wp = None
         self.path_goal = None
         self.path_tick = -100
@@ -387,7 +413,6 @@ class Bot:
         return math.atan2(dy, dx), clamp(math.atan2(dz, max(math.hypot(dx, dy), 1e-4)), -1.2, 1.2)
 
     def solve_intercept(self, muzzle_pos, target_pos, target_vel, proj_speed: float):
-        """Exact 3D quadratic intercept solver for Gun projectiles."""
         rx = target_pos[0] - muzzle_pos[0]
         ry = target_pos[1] - muzzle_pos[1]
         rz = target_pos[2] - muzzle_pos[2]
@@ -435,7 +460,7 @@ class Bot:
             if rx * dx + ry * dy <= 0.0:
                 continue
             lat = -rx * dy + ry * dx
-            if abs(lat) < 7.0:
+            if abs(lat) < 7.5:
                 sgn = 1.0 if lat >= 0.0 else -1.0
                 if abs(lat) < 0.3:
                     sgn = self.strafe_dir
@@ -443,7 +468,6 @@ class Bot:
         return None
 
     def get_astar_dir(self, tick: int, pos, goal_xy):
-        """Uses cached A* waypoint (replans every 10 ticks or if goal shifts >22m)."""
         if (
             self.path_wp is None
             or self.path_goal is None
@@ -455,15 +479,6 @@ class Bot:
             self.path_goal = goal_xy
             self.path_tick = tick
         return self.path_wp[0] - pos[0], self.path_wp[1] - pos[1]
-
-    def detect_third_party(self, enemies):
-        """Returns (brawler_a, brawler_b) if two visible enemies are actively fighting each other."""
-        n = min(len(enemies), 5)
-        for i in range(n):
-            for j in range(i + 1, n):
-                if dist2d(enemies[i]["pos"], enemies[j]["pos"]) < THIRD_PARTY_DIST:
-                    return (enemies[i], enemies[j])
-        return None
 
     def act(self, obs: mf.Observation) -> mf.Action:
         tick = obs["tick"]
@@ -497,7 +512,7 @@ class Bot:
         if self.strafe_timer >= self.strafe_period or (took_hit and self.strafe_timer >= 3):
             self.strafe_timer = 0
             self.strafe_dir = -self.strafe_dir
-            self.strafe_period = self.rng.randint(6, 9)
+            self.strafe_period = self.rng.randint(5, 8)
 
         action: mf.Action = {
             "tick": tick,
@@ -513,10 +528,9 @@ class Bot:
         if obs.get("offer") is not None:
             action["pick"] = self.pick_upgrade(obs["offer"])
 
-        # 2. Weapon pickup / swap (Hard-lock Laser + Gun)
+        # 2. Weapon pickup / swap (Lock Laser + Gun)
         held_kinds = {w["kind"] for w in weapons if w is not None}
         has_laser = "laser" in held_kinds
-        has_lightning = "lightning" in held_kinds
         has_bis = has_laser and ("gun" in held_kinds)
         empty_slot = 0 if weapons[0] is None else (1 if weapons[1] is None else None)
 
@@ -559,12 +573,10 @@ class Bot:
 
         enemies.sort(key=lambda e: dist2d(pos, e["pos"]))
         near_enemies = [e for e in enemies if dist2d(pos, e["pos"]) < 90.0]
-
-        # Detect active 3rd-party brawl
-        brawl = self.detect_third_party(enemies)
+        nearest_d = dist2d(pos, enemies[0]["pos"]) if enemies else 1e9
         snowball_mode = (t < SNOWBALL_TIME_S) and (my_cubes < SNOWBALL_CUBES)
 
-        # 4. Target Selection (Third-Party Vulture + Snowball Farm + Execute Lock)
+        # 4. Target Selection (Always aim/shoot closest visible threat or farmable)
         target = None
         target_type = None
         target_los = False
@@ -576,16 +588,10 @@ class Bot:
                 d = dist2d(pos, ep)
                 los = self.map.has_los(muzzle_pos, (ep[0], ep[1], ep[2] + 4.5))
                 hp = e.get("hp", 1000.0)
-                hp_w = 0.38 + 0.62 * (hp / max(e.get("max_hp", 1400.0), 1.0))
-
-                # Huge priority for kill-stealing low-HP brawlers
-                vulture_bonus = -65.0 if (los and hp < VULTURE_EXEC_HP) else 0.0
-                lock_bonus = -30.0 if (los and e["id"] == self.locked_id) else 0.0
-                e_yaw = e.get("aim", [0.0, 0.0])[0]
-                back_err = abs(angle_diff(math.atan2(pos[1] - ep[1], pos[0] - ep[0]), e_yaw))
-                backstab_bonus = -25.0 if (los and back_err > 1.45) else 0.0
-
-                scored.append((d * hp_w + vulture_bonus + lock_bonus + backstab_bonus + (0.0 if los else 135.0), los, e))
+                hp_w = 0.40 + 0.60 * (hp / max(e.get("max_hp", 1400.0), 1.0))
+                exec_bonus = -55.0 if (los and hp < 320.0) else 0.0
+                lock_bonus = -25.0 if (los and e["id"] == self.locked_id) else 0.0
+                scored.append((d * hp_w + exec_bonus + lock_bonus + (0.0 if los else 135.0), los, e))
             scored.sort(key=lambda x: x[0])
             _, target_los, target = scored[0]
             target_type = "mech"
@@ -593,32 +599,47 @@ class Bot:
         else:
             self.locked_id = None
 
-        # In Snowball Mode, prefer farming NPCs/crates unless a mech is close (<55m) or weak (<480 HP)
-        mech_urgent = (
-            target_type == "mech"
-            and (dist2d(pos, target["pos"]) < 55.0 or target.get("hp", 1000.0) < VULTURE_EXEC_HP)
-        )
-        if (target is None or (snowball_mode and not mech_urgent)) and npcs:
+        # Cowardly farm priority: farm NPCs/crates if no enemy is close (<75m)
+        if (target is None or (snowball_mode and nearest_d > 75.0)) and npcs:
             n = min(npcs, key=lambda x: dist2d(pos, x["pos"]))
             if dist2d(pos, n["pos"]) < 130.0:
                 n_los = self.map.has_los(muzzle_pos, (n["pos"][0], n["pos"][1], n["pos"][2] + 1.8))
                 target, target_type, target_los = n, "npc", n_los
-        elif (target is None or (snowball_mode and not mech_urgent)) and crates:
+        elif (target is None or (snowball_mode and nearest_d > 75.0)) and crates:
             c = min(crates, key=lambda x: dist2d(pos, x["pos"]))
             if dist2d(pos, c["pos"]) < 110.0:
                 c_los = self.map.has_los(muzzle_pos, (c["pos"][0], c["pos"][1], c["pos"][2] + 1.2))
                 target, target_type, target_los = c, "crate", c_los
 
+        # 4b. Cowardly FLEE Trigger
+        can_execute_safely = (
+            len(near_enemies) == 1
+            and target_type == "mech"
+            and target.get("hp", 1000.0) < 220.0
+            and hp_frac > 0.55
+        )
+        want_flee = (
+            not can_execute_safely
+            and (
+                len(near_enemies) >= 2
+                or (hp_frac < FLEE_HP_FRAC and nearest_d < 110.0)
+                or (nearest_d < FLEE_RUSH_DIST)
+            )
+        )
+        if want_flee:
+            self.flee_until = t + 2.2
+        fleeing = (t < self.flee_until) and bool(enemies)
+
         # Check Laser charge state for Corner-Peeking
         laser_w = next((w for w in weapons if w and w["kind"] == "laser"), None)
         laser_charge = laser_w.get("charge", 0.0) if laser_w else 0.0
         laser_full = laser_w["stats"].get("charge", 0.75) if laser_w else 0.75
-        laser_cd = laser_w.get("cooldown", 0.0) if laser_w else 0.0
-        laser_ready_to_peek = has_laser and (laser_charge >= laser_full * 0.62)
+        laser_ready_to_peek = has_laser and (laser_charge >= laser_full * 0.68)
 
-        # 5. Movement: A* Snowball / Laser Corner-Peek / Third-Party Vulture / 1v1 Backstab
+        # 5. Movement: Cowardly Flee / Strict Corner-Peek / Safe A* Snowball
         move_x, move_y = 0.0, 0.0
         want_boost = False
+        pre_checked = False
         mode_label = "ROAM"
         peek_pt = None
 
@@ -627,28 +648,42 @@ class Bot:
         urgent_zone = (not me["in_zone"]) or (d_zone > zr - 8.0 and t > zone["shrink_start"] - 12.0)
 
         close_cube = None
-        if cubes:
+        if cubes and not fleeing:
             c = min(cubes, key=lambda x: dist2d(pos, x["pos"]))
-            if dist2d(pos, c["pos"]) < (32.0 if near_enemies else 140.0):
+            if dist2d(pos, c["pos"]) < (24.0 if near_enemies else 140.0):
                 close_cube = c
 
         best_drop = None
-        for dr in drops:
-            dd = dist2d(pos, dr["pos"])
-            if dr["lands_in"] < 22.0 and dd < (210.0 if (snowball_mode or hp_frac < 0.75) else 120.0):
-                if len(near_enemies) <= 1 or dd < 25.0:
-                    best_drop = dr
-                    break
+        if not fleeing:
+            for dr in drops:
+                dd = dist2d(pos, dr["pos"])
+                if dr["lands_in"] < 22.0 and dd < (200.0 if (snowball_mode or hp_frac < 0.75) else 110.0):
+                    if not near_enemies or dd < 20.0:
+                        best_drop = dr
+                        break
 
         if urgent_zone:
             mode_label = "ZONE"
             move_x, move_y = self.get_astar_dir(tick, pos, zc)
-            want_boost = energy > 22.0
+            want_boost = energy > 20.0
+        elif fleeing:
+            mode_label = "FLEE"
+            threats = [e for e in enemies if dist2d(pos, e["pos"]) < 180.0]
+            fdir = self.map.find_flee_point(pos, muzzle_h, threats, zc, zr, self.prev_flee_dir)
+            if fdir is not None:
+                move_x, move_y = fdir
+                self.prev_flee_dir = fdir
+                pre_checked = True
+            else:
+                cx = sum(e["pos"][0] for e in threats) / len(threats)
+                cy = sum(e["pos"][1] for e in threats) / len(threats)
+                move_x, move_y = pos[0] - cx, pos[1] - cy
+            want_boost = energy > 18.0 and (took_hit or nearest_d < 65.0 or len(near_enemies) >= 2)
         elif close_cube is not None:
             mode_label = "CUBE"
             move_x, move_y = self.get_astar_dir(tick, pos, close_cube["pos"])
             want_boost = energy > 35.0 and dist2d(pos, close_cube["pos"]) > 14.0
-        elif best_drop is not None and (not near_enemies or hp_frac < 0.60):
+        elif best_drop is not None:
             mode_label = "DROP"
             dd = dist2d(pos, best_drop["pos"])
             if DROP_HOLD and dd < 3.0:
@@ -656,8 +691,7 @@ class Bot:
             else:
                 move_x, move_y = self.get_astar_dir(tick, pos, best_drop["pos"])
                 want_boost = energy > 35.0 and dd > best_drop["radius"]
-        elif not has_bis and pickups and (not near_enemies or snowball_mode):
-            # Prioritize finding Laser (or Gun if missing) via A*
+        elif not has_bis and pickups and not near_enemies:
             lp = [p for p in pickups if p["kind"] == "laser"]
             valid_p = lp if (lp and not has_laser) else [
                 p for p in pickups if p["kind"] not in held_kinds and not (AVOID_MORTAR and p["kind"] == "mortar")
@@ -674,68 +708,30 @@ class Bot:
             nx, ny = dx / d, dy / d
             secondaries = [e for e in enemies[:4] if e is not target]
 
-            if brawl is not None and d > 52.0 and target.get("hp", 1000.0) > VULTURE_EXEC_HP:
-                # THIRD-PARTY VULTURE: Hold ~95m near cover while they kill each other
-                mode_label = "VULTURE"
-                want_peek = laser_ready_to_peek or (not has_laser)
-                peek_pt = self.map.find_cover_and_peek(pos, muzzle_h, target, secondaries, want_peek, zc, zr)
-                if peek_pt is not None:
-                    move_x, move_y = peek_pt[0] - pos[0], peek_pt[1] - pos[1]
-                elif d < 85.0:
-                    move_x, move_y = -nx * 0.75 + (-ny * self.strafe_dir) * 0.65, -ny * 0.75 + (nx * self.strafe_dir) * 0.65
-                else:
-                    move_x, move_y = -ny * self.strafe_dir, nx * self.strafe_dir
-            elif has_laser and d > 34.0:
-                # LASER CORNER-PEEKER: Charge behind cover, peek out at >=62% charge to fire, duck back!
+            if has_laser:
+                # STRICT COWARDLY CORNER-PEEKER: Hide until Laser is >=68% charged, snap-fire, duck back
                 mode_label = "PEEK" if laser_ready_to_peek else "HIDE_CHG"
-                want_peek = laser_ready_to_peek or (laser_cd <= 0.0 and target.get("hp", 1000.0) < 280.0)
-                peek_pt = self.map.find_cover_and_peek(pos, muzzle_h, target, secondaries, want_peek, zc, zr)
+                peek_pt = self.map.find_cover_and_peek(pos, muzzle_h, target, secondaries, laser_ready_to_peek, zc, zr)
                 if peek_pt is not None:
                     move_x, move_y = peek_pt[0] - pos[0], peek_pt[1] - pos[1]
-                    if want_peek and not target_los and energy > 30.0:
-                        want_boost = True
                 else:
-                    # Fallback mid-range strafe if in open courtyard
                     sx, sy = -ny * self.strafe_dir, nx * self.strafe_dir
-                    ideal_d = 75.0
-                    rad_b = 0.45 if d > ideal_d + 15.0 else (-0.45 if d < ideal_d - 15.0 else 0.0)
-                    move_x, move_y = nx * rad_b + sx * 0.85, ny * rad_b + sy * 0.85
+                    rad_b = -0.60 if d < KITE_IDEAL_DIST else 0.25
+                    move_x, move_y = nx * rad_b + sx * 0.80, ny * rad_b + sy * 0.80
             else:
-                # CLOSE-RANGE BRAWL / LIGHTNING BACKSTAB ORBIT (V18 core)
-                mode_label = "BRAWL"
-                if len(near_enemies) >= 2:
-                    others = [e for e in near_enemies if e is not target]
-                    ox = sum(e["pos"][0] for e in others) / len(others)
-                    oy = sum(e["pos"][1] for e in others) / len(others)
-                    ax, ay = pos[0] - ox, pos[1] - oy
-                    am = max(math.hypot(ax, ay), 1e-4)
-                    ax, ay = ax / am, ay / am
-                    s1x, s1y = -ny, nx
-                    s2x, s2y = ny, -nx
-                    sx, sy = (s1x, s1y) if (s1x * ax + s1y * ay) >= (s2x * ax + s2y * ay) else (s2x, s2y)
-                    move_x, move_y = sx * 0.60 + ax * 0.55, sy * 0.60 + ay * 0.55
-                    want_boost = energy > 28.0 and dist2d(pos, others[0]["pos"]) < 45.0
+                # No Laser yet: kite at long range with Gun, never rush in
+                mode_label = "KITE"
+                sx, sy = -ny * self.strafe_dir, nx * self.strafe_dir
+                if d < KITE_IDEAL_DIST - 10.0:
+                    move_x, move_y = -nx * 0.72 + sx * 0.69, -ny * 0.72 + sy * 0.69
+                    want_boost = energy > 30.0 and d < 65.0
+                elif d > KITE_IDEAL_DIST + 20.0:
+                    move_x, move_y = nx * 0.45 + sx * 0.89, ny * 0.45 + sy * 0.89
                 else:
-                    e_yaw = target.get("aim", [0.0, 0.0])[0]
-                    rel = angle_diff(math.atan2(pos[1] - ey, pos[0] - ex), e_yaw)
-                    flank_dir = -1.0 if rel >= 0.0 else 1.0
-                    sx, sy = -ny * flank_dir, nx * flank_dir
-                    ideal_dist = 27.0 if (has_lightning and hp_frac > 0.30) else 56.0
-                    if hp_frac < 0.28:
-                        move_x, move_y = -nx * 0.72 + sx * 0.70, -ny * 0.72 + sy * 0.70
-                        want_boost = energy > 22.0
-                    elif d > ideal_dist + 8.0:
-                        move_x, move_y = nx * 0.57 + sx * 0.82, ny * 0.57 + sy * 0.82
-                        want_boost = has_lightning and d < 62.0 and energy > 35.0
-                    elif d < ideal_dist - 8.0:
-                        move_x, move_y = -nx * 0.52 + sx * 0.85, -ny * 0.52 + sy * 0.85
-                    else:
-                        move_x, move_y = sx, sy
-                        if has_lightning and d < 36.0 and 0.65 < abs(rel) < 1.90 and energy > 35.0:
-                            want_boost = True
+                    move_x, move_y = sx, sy
         elif target_type in ("npc", "crate"):
             mode_label = "FARM"
-            if dist2d(pos, target["pos"]) > 28.0:
+            if dist2d(pos, target["pos"]) > 32.0:
                 move_x, move_y = self.get_astar_dir(tick, pos, target["pos"])
             else:
                 dx, dy = target["pos"][0] - pos[0], target["pos"][1] - pos[1]
@@ -746,7 +742,7 @@ class Bot:
         else:
             if self.roam_target is None or dist2d(pos, self.roam_target) < 18.0:
                 ang = self.rng.uniform(0.0, TWO_PI)
-                rad = self.rng.uniform(0.20, 0.75) * max(zr - 18.0, 12.0)
+                rad = self.rng.uniform(0.40, 0.82) * max(zr - 18.0, 12.0)
                 self.roam_target = (
                     clamp(zc[0] + math.cos(ang) * rad, self.map.bounds[0] + 10.0, self.map.bounds[1] - 10.0),
                     clamp(zc[1] + math.sin(ang) * rad, self.map.bounds[2] + 10.0, self.map.bounds[3] - 10.0),
@@ -758,10 +754,14 @@ class Bot:
             ld = self.laser_dodge(pos, enemies)
             if ld is not None:
                 move_x, move_y = ld
-                if energy > 20.0:
+                pre_checked = False
+                if energy > 18.0:
                     want_boost = True
 
-        mx, my = self.map.steer_around_walls(pos, move_x, move_y)
+        if pre_checked:
+            mx, my = move_x, move_y
+        else:
+            mx, my = self.map.steer_around_walls(pos, move_x, move_y)
         action["move"] = [round(mx, 4), round(my, 4)]
         action["boost"] = want_boost
 
@@ -774,9 +774,10 @@ class Bot:
                 self.strafe_dir = -self.strafe_dir
                 self.roam_target = None
                 self.path_wp = None
+                self.prev_flee_dir = None
                 self.stuck_ticks = 0
 
-        # 6. Aimbot & Firing (Pre-charge Laser behind cover, release on peek!)
+        # 6. Aimbot & Firing (Still shoots while fleeing/kiting!)
         if target is not None:
             tpos = target["pos"]
             tvel = target.get("vel", [0.0, 0.0, 0.0])
@@ -805,29 +806,30 @@ class Bot:
                     full_charge = wstats.get("charge", 0.75)
                     min_charge = wstats.get("min_charge", 0.15)
                     if target_type == "mech" and d_target <= wstats.get("range", 280.0):
-                        # Hitscan aim directly at center mass
                         lyaw, lpitch = self.aim_at_point(muzzle_pos, aim_center)
                         lyaw_err = abs(angle_diff(lyaw, cur_yaw))
                         if charge == 0.0:
-                            # Start charging EVEN BEHIND COVER so we peek at full charge!
-                            if w.get("cooldown", 0.0) <= 0.0 and d_target < 220.0:
+                            # Don't slow ourselves down charging while actively fleeing
+                            if not fleeing and w.get("cooldown", 0.0) <= 0.0 and d_target < 230.0:
                                 fire_flags[s_idx] = True
                         else:
-                            # Release to fire ONLY when we have LOS and tight aim
                             if target_los and (
                                 (charge >= full_charge * 0.75 and lyaw_err < 0.07)
                                 or (charge >= min_charge and target.get("hp", 1000.0) < 170.0 and lyaw_err < 0.08)
                             ):
                                 des_yaw, des_pitch = lyaw, lpitch
                                 fire_flags[s_idx] = False
+                            elif fleeing:
+                                # Release early if we need full sprint speed to flee
+                                fire_flags[s_idx] = False
                             else:
-                                # Keep holding charge while stepping out of cover
                                 if target_los:
                                     des_yaw, des_pitch = lyaw, lpitch
                                 fire_flags[s_idx] = True
 
                 elif kind == "lightning":
-                    if target_los and d_target <= wstats.get("range", 45.0) - 1.0 and yaw_err < 0.48 and energy > 5.0:
+                    # Reserve energy for fleeing unless enemy is right on top of us
+                    if target_los and d_target <= wstats.get("range", 45.0) - 1.0 and yaw_err < 0.48 and energy > 25.0:
                         fire_flags[s_idx] = True
 
                 elif kind == "gun":
@@ -837,7 +839,7 @@ class Bot:
             if not target_los:
                 for w in weapons:
                     if w and w["kind"] == "gun" and w.get("reload", 0.0) <= 0.0:
-                        if w.get("ammo", 12) < w["stats"].get("mag", 12) * 0.60:
+                        if w.get("ammo", 12) < w["stats"].get("mag", 12) * 0.65:
                             action["reload"] = True
 
             action["aim"] = [round(des_yaw, 4), round(des_pitch, 4)]
