@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-ApexMech v19.0 - Full-Suite Tactical Assassin (mechfight/1)
-Expanded from V11 (4.33) / V18:
-- Scored 9-ray movement evaluator (wall clearance + zone safety + 1v1 isolation)
-- Exact 3D quadratic intercept aimbot with V11's fast 0.15 rad fire window
-- Short-term target memory & peek pre-aiming
-- Soft-blend CPA projectile & mortar dodging
-- Dynamic 1v1 backstab / 1v2 angle-split / 1v3+ weighted kite
-Standard library only. (<2ms/tick)
+ApexMech v20.0 - Thanos Pie-Slicer / No-Hit Isolator (mechfight/1)
+- 8-direction building-cover pie-slicing: puts buildings between you & secondary enemies
+  while keeping LOS on your locked target
+- Hard kill-lock: finishes targets to delete DPS & chain cube heals (zero hold-fire)
+- 1v1 full-speed 1.5x rear-armor backstab orbit + exact 3D quadratic aimbot
+Standard library only. (<3ms/tick)
 """
 import json
 import math
@@ -17,6 +15,7 @@ import mechfight as mf
 
 
 TWO_PI = 6.283185307179586
+DIRS_8 = tuple((math.cos(i * 0.7853981633974483), math.sin(i * 0.7853981633974483)) for i in range(8))
 
 
 def clamp(v: float, lo: float, hi: float) -> float:
@@ -57,8 +56,6 @@ def point_in_ring(x: float, y: float, ring) -> bool:
 
 
 class ArenaMap:
-    """Fast tuple-packed spatial-grid lookup for buildings, stadium, and bridges."""
-
     def __init__(self, map_dir: str):
         self.cell_size = 45.0
         self.grid: dict[tuple[int, int], list[int]] = {}
@@ -137,14 +134,14 @@ class ArenaMap:
                     return True
         return False
 
-    def has_los(self, a, b) -> bool:
+    def has_los(self, a, b, max_steps: int = 12) -> bool:
         dx = b[0] - a[0]
         dy = b[1] - a[1]
         dz = b[2] - a[2]
         d = math.sqrt(dx * dx + dy * dy + dz * dz)
         if d < 6.0:
             return True
-        steps = min(int(d / 10.0), 13)
+        steps = min(int(d / 11.0), max_steps)
         if steps < 2:
             return True
         sx, sy, sz = dx / steps, dy / steps, dz / steps
@@ -157,64 +154,79 @@ class ArenaMap:
             z += sz
         return True
 
-    def steer_scored(self, pos, desired_dx: float, desired_dy: float, zc, zr: float, secondary_enemies=None):
-        """
-        Scores 9 candidate directions around the desired vector for:
-        - alignment with desired direction
-        - 5m & 10m wall clearance
-        - staying inside the next safe zone
-        - separation from secondary enemies (1v1 isolation)
-        """
+    def steer_around_walls(self, pos, desired_dx: float, desired_dy: float):
         mag = math.hypot(desired_dx, desired_dy)
         if mag < 1e-4:
             return 0.0, 0.0
         base_ang = math.atan2(desired_dy, desired_dx)
         x, y, z = pos[0], pos[1], pos[2]
-        zx, zy = zc[0], zc[1]
-        safe_r = max(zr - 8.0, 6.0)
-
-        best_score = -1e9
-        best_vec = (desired_dx / mag, desired_dy / mag)
-
-        for off in (0.0, 0.32, -0.32, 0.68, -0.68, 1.12, -1.12, 1.65, -1.65):
+        for off in (0.0, 0.4, -0.4, 0.8, -0.8, 1.25, -1.25, 1.75, -1.75, 2.25, -2.25):
             ang = base_ang + off
             ca, sa = math.cos(ang), math.sin(ang)
+            if not self.is_blocked_body(x + ca * 4.8, y + sa * 4.8, z) and not self.is_blocked_body(x + ca * 9.0, y + sa * 9.0, z):
+                return ca, sa
+        return desired_dx / mag, desired_dy / mag
 
-            # Hard wall check at 4.8m
-            if self.is_blocked_body(x + ca * 4.8, y + sa * 4.8, z):
+    def pie_slice_direction(self, pos, muzzle_h: float, primary, secondaries, ideal_dist: float, zc, zr: float):
+        """
+        NO-HIT PIE-SLICER:
+        Evaluates 8 candidate positions (12m away) and picks the move that:
+        1. Uses buildings to BLOCK LOS from secondary enemies (0 incoming crossfire!)
+        2. Keeps LOS on our locked primary target so we finish the kill
+        3. Stays near ideal_dist & inside the safe zone
+        """
+        x, y, z = pos[0], pos[1], pos[2]
+        px, py, pz = primary["pos"][0], primary["pos"][1], primary["pos"][2] + 4.5
+        zx, zy = zc[0], zc[1]
+        safe_r = max(zr - 10.0, 8.0)
+
+        best_score = -1e9
+        best_dir = None
+
+        for ca, sa in DIRS_8:
+            # Must not walk into a wall
+            if self.is_blocked_body(x + ca * 5.0, y + sa * 5.0, z):
+                continue
+            nx, ny = x + ca * 12.0, y + sa * 12.0
+            if self.is_blocked_body(nx, ny, z):
                 continue
 
-            # Alignment score (prefer staying close to desired direction)
-            score = 100.0 * math.cos(off)
+            cand_muzzle = (nx, ny, z + muzzle_h)
+            score = 0.0
 
-            # Soft wall lookahead at 9.5m
-            if self.is_blocked_body(x + ca * 9.5, y + sa * 9.5, z):
-                score -= 55.0
+            # 1. MASSIVE PENALTY for any secondary enemy that can shoot us at this spot
+            for se in secondaries[:3]:
+                sp = se["pos"]
+                sd = math.hypot(nx - sp[0], ny - sp[1])
+                if sd < 150.0:
+                    if self.has_los(cand_muzzle, (sp[0], sp[1], sp[2] + 4.5), max_steps=7):
+                        score -= 95.0 + max(0.0, 70.0 - sd) * 0.8
+                    else:
+                        # Hidden behind a building from this enemy!
+                        score += 40.0
 
-            # Zone boundary penalty
-            nx, ny = x + ca * 10.0, y + sa * 10.0
-            d_zone = math.hypot(nx - zx, ny - zy)
-            if d_zone > safe_r:
-                score -= (d_zone - safe_r) * 2.5
+            # 2. Keep LOS on our locked primary target so we keep dealing 100% DPS
+            pd = math.hypot(nx - px, ny - py)
+            if self.has_los(cand_muzzle, (px, py, pz), max_steps=8):
+                score += 65.0
+                score -= abs(pd - ideal_dist) * 0.9
+            else:
+                score -= 20.0
 
-            # Secondary enemy separation bonus (keeps 1v2s isolated)
-            if secondary_enemies:
-                for se in secondary_enemies:
-                    sep = se["pos"]
-                    d_now = math.hypot(x - sep[0], y - sep[1])
-                    d_nxt = math.hypot(nx - sep[0], ny - sep[1])
-                    if d_now < 55.0:
-                        score += (d_nxt - d_now) * 1.8
+            # 3. Zone safety
+            dz = math.hypot(nx - zx, ny - zy)
+            if dz > safe_r:
+                score -= (dz - safe_r) * 3.0
 
             if score > best_score:
                 best_score = score
-                best_vec = (ca, sa)
+                best_dir = (ca, sa)
 
-        return best_vec
+        return best_dir
 
 
 class Bot:
-    name = "ApexMech-v19.0"
+    name = "ApexMech-v20.0"
 
     def __init__(self, hello: mf.Hello):
         self.slot = hello["slot"]
@@ -223,20 +235,19 @@ class Bot:
         self.map = ArenaMap(hello["map"]["dir"])
         self.pickup_r = self.config.get("loot", {}).get("pickup_radius", 4.0)
 
-        # Best-in-slot: Gun + Lightning (427+ DPS front, 640+ DPS rear)
+        # Best-in-slot: Gun + Lightning
         self.weapon_rank = {"lightning": 5, "gun": 4, "laser": 3, "mortar": 1}
-
         self.upgrade_weights = {
             "armor": 100,
             "lightning": 98,
             "hp": 97,
             "gun_rate": 95,
             "gun_damage": 94,
-            "speed": 92,
+            "speed": 93,
             "regen": 90,
             "reload": 88,
-            "boost": 85,
-            "energy": 83,
+            "boost": 86,
+            "energy": 84,
             "laser": 78,
             "sensors": 62,
             "mortar": 35,
@@ -250,11 +261,7 @@ class Bot:
         self.last_damage_bearing = None
         self.last_damage_t = -10.0
         self.roam_target = None
-
-        # Short-term target memory for peek pre-aiming
-        self.mem_pos = None
-        self.mem_vel = (0.0, 0.0, 0.0)
-        self.mem_t = -10.0
+        self.locked_id = None
 
     def pick_upgrade(self, offer) -> int:
         best_i, best_score = 0, -1e9
@@ -276,7 +283,7 @@ class Bot:
         return math.atan2(dy, dx), clamp(math.atan2(dz, max(math.hypot(dx, dy), 1e-4)), -1.2, 1.2)
 
     def solve_intercept(self, muzzle_pos, target_pos, target_vel, proj_speed: float):
-        """Exact 3D quadratic intercept solver for moving targets."""
+        """Exact 3D quadratic intercept aimbot for moving targets."""
         rx = target_pos[0] - muzzle_pos[0]
         ry = target_pos[1] - muzzle_pos[1]
         rz = target_pos[2] - muzzle_pos[2]
@@ -321,14 +328,16 @@ class Bot:
             return 0.78
         return clamp(math.atan((v2 - math.sqrt(disc)) / (gravity * r)), -0.5, 1.3)
 
-    def soft_projectile_dodge(self, pos, projectiles):
-        """Returns a perpendicular dodge vector only for imminent hits (especially mortars)."""
+    def incoming_mortar_dodge(self, pos, projectiles):
+        """Only dodges imminent mortars (which drain 45 energy + knockback)."""
         mx, my = pos[0], pos[1]
         for p in projectiles:
+            if p.get("kind") != "mortar":
+                continue
             px, py = p["pos"][0], p["pos"][1]
             vx, vy = p["vel"][0], p["vel"][1]
             spd2 = vx * vx + vy * vy
-            if spd2 < 12.0:
+            if spd2 < 10.0:
                 continue
             rx, ry = mx - px, my - py
             if rx * rx + ry * ry > 42.0 * 42.0:
@@ -337,15 +346,13 @@ class Bot:
             if dot <= 0.0:
                 continue
             t_cpa = dot / spd2
-            if t_cpa > 0.55:
+            if t_cpa > 0.65:
                 continue
             cpa_x = px + vx * t_cpa - mx
             cpa_y = py + vy * t_cpa - my
-            is_mortar = p.get("kind") == "mortar"
-            hit_r = 7.2 if is_mortar else 4.6
-            if cpa_x * cpa_x + cpa_y * cpa_y < hit_r * hit_r:
+            if cpa_x * cpa_x + cpa_y * cpa_y < 56.0:
                 spd = math.sqrt(spd2)
-                return (-vy / spd) * self.strafe_dir, (vx / spd) * self.strafe_dir, is_mortar
+                return (-vy / spd) * self.strafe_dir, (vx / spd) * self.strafe_dir
         return None
 
     def act(self, obs: mf.Observation) -> mf.Action:
@@ -357,7 +364,8 @@ class Bot:
         weapons = me["weapons"]
         my_cubes = me.get("cubes", 0)
         stats = me.get("stats", {})
-        muzzle_pos = (pos[0], pos[1], pos[2] + stats.get("muzzle_height", 7.0))
+        muzzle_h = stats.get("muzzle_height", 7.0)
+        muzzle_pos = (pos[0], pos[1], pos[2] + muzzle_h)
         cur_yaw, _ = me["aim"]
 
         took_hit = False
@@ -374,7 +382,6 @@ class Bot:
             self.stuck_ticks = 0
         self.last_pos = pos
 
-        # Flip strafe on timer or reactive hit to break enemy aim prediction
         self.strafe_timer += 1
         if self.strafe_timer >= self.strafe_period or (took_hit and self.strafe_timer >= 3):
             self.strafe_timer = 0
@@ -434,37 +441,37 @@ class Bot:
         zc = zone["next_center"]
         zr = zone["next_radius"]
 
-        # 4. Target Selection (Backstab 1.5x + Execute Focus + Fast 3-Enemy LOS)
+        # 4. HARD KILL-LOCK Target Selection ("When we lock, we kill")
         enemies.sort(key=lambda e: dist2d(pos, e["pos"]))
-        near_enemies = [e for e in enemies if dist2d(pos, e["pos"]) < 85.0]
+        near_enemies = [e for e in enemies if dist2d(pos, e["pos"]) < 95.0]
         target = None
         target_type = None
         target_los = False
 
         if enemies:
             scored = []
-            for e in enemies[:3]:
+            for e in enemies[:4]:
                 ep = e["pos"]
                 d = dist2d(pos, ep)
                 los = self.map.has_los(muzzle_pos, (ep[0], ep[1], ep[2] + 4.5))
                 hp = e.get("hp", 1000.0)
-                hp_w = 0.42 + 0.58 * (hp / max(e.get("max_hp", 1400.0), 1.0))
+                hp_w = 0.40 + 0.60 * (hp / max(e.get("max_hp", 1400.0), 1.0))
+
+                # Huge lock-on bonus so we finish kills instead of splitting damage
+                lock_bonus = -55.0 if (los and e["id"] == self.locked_id) else 0.0
+                exec_bonus = -35.0 if (los and hp < 360.0) else 0.0
 
                 e_yaw = e.get("aim", [0.0, 0.0])[0]
                 back_err = abs(angle_diff(math.atan2(pos[1] - ep[1], pos[0] - ep[0]), e_yaw))
-                backstab_bonus = -32.0 if (los and back_err > 1.45) else 0.0
-                exec_bonus = -35.0 if (los and hp < 360.0) else 0.0
-                # Short a charging laser if in Lightning range and not abandoning a 1-shot kill
-                short_bonus = -22.0 if (has_lightning and los and d < 43.0 and e.get("charging")) else 0.0
+                backstab_bonus = -28.0 if (los and back_err > 1.45) else 0.0
 
-                scored.append((d * hp_w + backstab_bonus + exec_bonus + short_bonus + (0.0 if los else 130.0), los, e))
+                scored.append((d * hp_w + lock_bonus + exec_bonus + backstab_bonus + (0.0 if los else 135.0), los, e))
             scored.sort(key=lambda x: x[0])
             _, target_los, target = scored[0]
             target_type = "mech"
-            # Save to short-term memory for peek pre-aiming
-            self.mem_pos = target["pos"]
-            self.mem_vel = target.get("vel", (0.0, 0.0, 0.0))
-            self.mem_t = t
+            self.locked_id = target["id"]
+        else:
+            self.locked_id = None
 
         # Farm NPCs/crates when no close enemy (<65m) and we want cubes/upgrades
         if (target is None or (my_cubes < 15 and dist2d(pos, target["pos"]) > 65.0)) and npcs:
@@ -480,10 +487,10 @@ class Bot:
                 if c_los or target is None:
                     target, target_type, target_los = c, "crate", c_los
 
-        # 5. Movement: Dynamic 1v1 Backstab / 1v2 Angle-Split / 1v3+ Weighted Kite
+        # 5. Movement: Building-Cover Pie-Slicer (1v2+) & Blind-Spot Backstab (1v1)
         move_x, move_y = 0.0, 0.0
         want_boost = False
-        secondary_enemies = None
+        used_pie_slice = False
 
         d_zone = dist2d(pos, zc)
         outside_next = d_zone > max(zr - 18.0, 5.0)
@@ -518,45 +525,20 @@ class Bot:
             d = max(math.hypot(dx, dy), 1e-4)
             nx, ny = dx / d, dy / d
 
-            if len(near_enemies) >= 3:
-                # 1v3+ WEIGHTED REPULSION KITE (1/d^2 away from closest divers toward zone)
-                rx, ry = 0.0, 0.0
-                for e in near_enemies[:4]:
-                    edx = pos[0] - e["pos"][0]
-                    edy = pos[1] - e["pos"][1]
-                    ed2 = max(edx * edx + edy * edy, 25.0)
-                    w = 1000.0 / ed2
-                    ed = math.sqrt(ed2)
-                    rx += (edx / ed) * w
-                    ry += (edy / ed) * w
-                rm = max(math.hypot(rx, ry), 1e-4)
-                rnx, rny = rx / rm, ry / rm
-                sx, sy = -rny * self.strafe_dir, rnx * self.strafe_dir
-                zx, zy = zc[0] - pos[0], zc[1] - pos[1]
-                zm = max(math.hypot(zx, zy), 1e-4)
-                move_x = rnx * 0.72 + sx * 0.55 + (zx / zm) * 0.25
-                move_y = rny * 0.72 + sy * 0.55 + (zy / zm) * 0.25
-                want_boost = energy > 26.0 and dist2d(pos, near_enemies[0]["pos"]) < 42.0
-                secondary_enemies = [e for e in near_enemies if e is not target]
-            elif len(near_enemies) == 2:
-                # 1v2 ANGLE-SPLIT ISOLATION: strafe around primary target away from 2nd bot
-                others = [e for e in near_enemies if e is not target]
-                secondary_enemies = others
-                ox, oy = others[0]["pos"][0], others[0]["pos"][1]
-                ax, ay = pos[0] - ox, pos[1] - oy
-                am = max(math.hypot(ax, ay), 1e-4)
-                ax, ay = ax / am, ay / am
-
-                s1x, s1y = -ny, nx
-                s2x, s2y = ny, -nx
-                sx, sy = (s1x, s1y) if (s1x * ax + s1y * ay) >= (s2x * ax + s2y * ay) else (s2x, s2y)
-
-                # Hold Lightning chain range (~34m) if healthy, otherwise widen out
-                ideal_dist = 34.0 if (has_lightning and hp_frac > 0.36) else 56.0
-                rad_bias = 0.25 if d > ideal_dist + 8.0 else (-0.30 if d < ideal_dist - 8.0 else 0.0)
-                move_x = sx * 0.65 + ax * 0.48 + nx * rad_bias
-                move_y = sy * 0.65 + ay * 0.48 + ny * rad_bias
-                want_boost = energy > 30.0 and dist2d(pos, others[0]["pos"]) < 44.0
+            if len(near_enemies) >= 2:
+                # THANOS PIE-SLICER: Use buildings to block secondary enemies while shredding locked target!
+                secondaries = [e for e in near_enemies if e is not target]
+                ideal_d = 32.0 if (has_lightning and hp_frac > 0.34) else 56.0
+                pie = self.map.pie_slice_direction(pos, muzzle_h, target, secondaries, ideal_d, zc, zr)
+                if pie is not None:
+                    move_x, move_y = pie
+                    used_pie_slice = True
+                    want_boost = energy > 28.0 and (took_hit or dist2d(pos, secondaries[0]["pos"]) < 42.0)
+                else:
+                    cx = sum(e["pos"][0] for e in near_enemies) / len(near_enemies)
+                    cy = sum(e["pos"][1] for e in near_enemies) / len(near_enemies)
+                    move_x, move_y = pos[0] - cx, pos[1] - cy
+                    want_boost = energy > 28.0
             else:
                 # 1v1 FULL-SPEED ASSASSIN BACKSTAB ORBIT
                 e_yaw = target.get("aim", [0.0, 0.0])[0]
@@ -566,7 +548,7 @@ class Bot:
                 if self.map.is_blocked_body(pos[0] + sx * 6.0, pos[1] + sy * 6.0, pos[2]):
                     sx, sy = -sx, -sy
 
-                ideal_dist = 26.0 if (has_lightning and hp_frac > 0.28) else 58.0
+                ideal_dist = 27.0 if (has_lightning and hp_frac > 0.28) else 58.0
                 if hp_frac < 0.24:
                     move_x = -nx * 0.72 + sx * 0.70
                     move_y = -ny * 0.72 + sy * 0.70
@@ -583,10 +565,10 @@ class Bot:
                     if has_lightning and d < 36.0 and 0.65 < abs(rel) < 1.90 and energy > 32.0:
                         want_boost = True
 
-            # Immediate perpendicular boost-dodge against charging lasers
             if target.get("charging"):
                 move_x, move_y = (-ny) * self.strafe_dir, nx * self.strafe_dir
                 want_boost = energy > 15.0
+                used_pie_slice = False
         elif not has_bis and pickups:
             lp = [p for p in pickups if p["kind"] == "lightning"]
             valid_p = lp if (lp and not has_lightning) else [p for p in pickups if p["kind"] not in held_kinds]
@@ -612,16 +594,19 @@ class Bot:
                 )
             move_x, move_y = self.roam_target[0] - pos[0], self.roam_target[1] - pos[1]
 
-        # Soft-blend CPA projectile dodge (protects against mortars without breaking orbit)
-        dodge = self.soft_projectile_dodge(pos, obs.get("projectiles", []))
-        if dodge is not None:
-            weight = 0.75 if dodge[2] else 0.45
-            move_x = move_x * (1.0 - weight * 0.5) + dodge[0] * weight
-            move_y = move_y * (1.0 - weight * 0.5) + dodge[1] * weight
-            if dodge[2] and energy > 22.0:
+        # Dodge imminent mortar shells
+        mdodge = self.incoming_mortar_dodge(pos, obs.get("projectiles", []))
+        if mdodge is not None:
+            move_x, move_y = mdodge
+            used_pie_slice = False
+            if energy > 20.0:
                 want_boost = True
 
-        mx, my = self.map.steer_scored(pos, move_x, move_y, zc, zr, secondary_enemies)
+        if used_pie_slice:
+            mx, my = move_x, move_y
+        else:
+            mx, my = self.map.steer_around_walls(pos, move_x, move_y)
+
         action["move"] = [round(mx, 4), round(my, 4)]
         action["boost"] = want_boost
 
@@ -635,7 +620,7 @@ class Bot:
                 self.roam_target = None
                 self.stuck_ticks = 0
 
-        # 6. Aimbot & Firing (Exact Quadratic Intercept + Peek Pre-Aim)
+        # 6. Aimbot & 100% Aggressive Firing (Zero Hold-Fire)
         if target is not None:
             tpos = target["pos"]
             tvel = target.get("vel", [0.0, 0.0, 0.0])
@@ -690,7 +675,6 @@ class Bot:
                         if yaw_err < 0.14:
                             fire_flags[s_idx] = True
 
-            # Free reload only when target is behind cover and mag < 55%
             if not target_los:
                 for w in weapons:
                     if w and w["kind"] == "gun" and w.get("reload", 0.0) <= 0.0:
@@ -700,17 +684,7 @@ class Bot:
             action["aim"] = [round(des_yaw, 4), round(des_pitch, 4)]
             action["fire"] = fire_flags
         else:
-            # Pre-aim at last known enemy position for 1.5s if they ducked behind cover
-            if self.mem_pos is not None and (t - self.mem_t) < 1.5:
-                dt = t - self.mem_t
-                pred = (
-                    self.mem_pos[0] + self.mem_vel[0] * dt * 0.5,
-                    self.mem_pos[1] + self.mem_vel[1] * dt * 0.5,
-                    self.mem_pos[2] + 4.5,
-                )
-                pyaw, ppitch = self.aim_at_point(muzzle_pos, pred)
-                action["aim"] = [round(pyaw, 4), round(ppitch, 4)]
-            elif self.last_damage_bearing is not None and (t - self.last_damage_t) < 2.5:
+            if self.last_damage_bearing is not None and (t - self.last_damage_t) < 2.5:
                 action["aim"] = [round(self.last_damage_bearing, 4), 0.0]
             elif obs.get("sounds"):
                 near_sounds = [s for s in obs["sounds"] if s["dist"] in ("near", "mid")]
