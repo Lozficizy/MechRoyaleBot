@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-ApexMech v1.5 - Mech Royale Bot (mechfight/1)
-Uses official mechfight.py wrapper. Standard library only.
+ApexMech v2.0 - Mech Royale Bot (mechfight/1)
+Cover-seeking regen, 1v1 LOS funneling, true projectile dodging, dual-wield DPS.
+Standard library only.
 """
 import json
 import math
@@ -49,13 +50,13 @@ def point_in_ring(x: float, y: float, ring) -> bool:
 
 
 class ArenaMap:
-    """Spatial-grid lookup for prisms (buildings/stadium/bridges) and terrain."""
+    """Fast spatial-grid lookup for prisms (buildings/stadium/bridges) and terrain."""
 
     def __init__(self, map_dir: str):
         self.cell_size = 40.0
         self.grid: dict[tuple[int, int], list[int]] = {}
         self.prisms: list[dict] = []
-        self.bounds = (-512.0, 555.0, -333.0, 388.0)
+        self.bounds = (-508.0, 551.0, -329.0, 384.0)
         self.terrain = None
         self.nx = 0
         self.ny = 0
@@ -177,12 +178,11 @@ class ArenaMap:
                     return True
         return False
 
-    def has_los(self, a, b) -> bool:
-        """Fast stepped 3D line-of-sight check against prisms."""
+    def has_los(self, a, b, step_m: float = 5.0, max_steps: int = 36) -> bool:
         d = dist3d(a, b)
         if d < 5.0:
             return True
-        steps = min(int(d / 4.0), 45)
+        steps = min(int(d / step_m), max_steps)
         if steps < 2:
             return True
         dx = (b[0] - a[0]) / steps
@@ -214,9 +214,57 @@ class ArenaMap:
                 return ca, sa
         return desired_dx / mag, desired_dy / mag
 
+    def find_cover_direction(self, pos, enemies, zone_center, zone_radius, want_zero_los: bool):
+        """Sample 12 directions around mech to minimize enemy LOS while staying in zone."""
+        x, y, z = pos[0], pos[1], pos[2]
+        top_enemies = sorted(enemies, key=lambda e: dist2d(pos, e["pos"]))[:4]
+        best_score = 1e9
+        best_dir = None
+
+        for k in range(12):
+            ang = k * (math.pi / 6.0)
+            ca, sa = math.cos(ang), math.sin(ang)
+            # Check immediate walkability
+            if self.is_blocked_body(x + ca * 5.0, y + sa * 5.0, z):
+                continue
+            tx, ty = x + ca * 18.0, y + sa * 18.0
+            if self.is_blocked_body(tx, ty, z):
+                tx, ty = x + ca * 11.0, y + sa * 11.0
+                if self.is_blocked_body(tx, ty, z):
+                    continue
+
+            tz = self.ground_z(tx, ty) + 6.5
+            # Count how many enemies have LOS to this candidate spot
+            los_cnt = 0
+            min_edist = 999.0
+            for e in top_enemies:
+                ep = e["pos"]
+                ed = dist2d((tx, ty), ep)
+                if ed < min_edist:
+                    min_edist = ed
+                if self.has_los((tx, ty, tz), (ep[0], ep[1], ep[2] + 7.0), step_m=7.0, max_steps=20):
+                    los_cnt += 1
+
+            d_zone = dist2d((tx, ty), zone_center)
+            zone_pen = max(0.0, d_zone - (zone_radius - 12.0)) * 4.0
+
+            if want_zero_los:
+                # Strongly prefer 0 LOS and distance away from enemies
+                score = los_cnt * 120.0 - min(min_edist, 90.0) * 0.9 + zone_pen
+            else:
+                # Prefer 1 LOS (funneling) or 0 LOS, avoiding 2+ LOS
+                los_pen = 0.0 if los_cnt == 1 else (30.0 if los_cnt == 0 else los_cnt * 100.0)
+                score = los_pen - min(min_edist, 70.0) * 0.4 + zone_pen
+
+            if score < best_score:
+                best_score = score
+                best_dir = (ca, sa)
+
+        return best_dir
+
 
 class Bot:
-    name = "ApexMech-v1.5"
+    name = "ApexMech-v2.0"
 
     def __init__(self, hello: mf.Hello):
         self.slot = hello["slot"]
@@ -225,24 +273,24 @@ class Bot:
         self.map = ArenaMap(hello["map"]["dir"])
         self.pickup_r = self.config.get("loot", {}).get("pickup_radius", 4.0)
 
-        # Weapon preference
+        # Lightning is #1 for 1v15 horde (240 DPS + chain + shorts lasers), Laser #2, Gun #3
         self.weapon_rank = {"lightning": 4, "laser": 3, "gun": 2, "mortar": 1}
 
-        # Upgrade preference keywords
+        # Upgrade preference keywords (survival & sustained DPS > everything)
         self.upgrade_weights = {
             "armor": 100,
+            "regen": 98,
             "hp": 96,
-            "regen": 92,
-            "lightning": 90,
-            "gun_damage": 88,
-            "gun_rate": 86,
-            "laser": 84,
-            "speed": 78,
-            "boost": 76,
-            "energy": 74,
-            "sensors": 66,
-            "reload": 62,
-            "mortar": 45,
+            "lightning": 94,
+            "gun_rate": 90,
+            "gun_damage": 89,
+            "laser": 85,
+            "speed": 82,
+            "boost": 80,
+            "energy": 78,
+            "reload": 70,
+            "sensors": 62,
+            "mortar": 40,
         }
 
         self.last_pos = None
@@ -252,6 +300,7 @@ class Bot:
         self.last_damage_bearing = None
         self.last_damage_t = -10.0
         self.roam_target = None
+        self.regen_mode = False
 
     def pick_upgrade(self, offer) -> int:
         best_i = 0
@@ -305,6 +354,32 @@ class Bot:
         tan_theta = (v2 - math.sqrt(disc)) / (gravity * r)
         return clamp(math.atan(tan_theta), -0.5, 1.3)
 
+    def incoming_projectile_dodge(self, pos, projectiles):
+        """Return perpendicular dodge vector only if a projectile is heading straight at us."""
+        mx, my = pos[0], pos[1]
+        for p in projectiles:
+            px, py = p["pos"][0], p["pos"][1]
+            vx, vy = p["vel"][0], p["vel"][1]
+            spd2 = vx * vx + vy * vy
+            if spd2 < 10.0:
+                continue
+            rx, ry = mx - px, my - py
+            dist2 = rx * rx + ry * ry
+            if dist2 > 45.0 * 45.0:
+                continue
+            dot = rx * vx + ry * vy
+            if dot <= 0.0:
+                continue  # Moving away
+            t_cpa = dot / spd2
+            if t_cpa > 0.65:
+                continue
+            cpa_x = px + vx * t_cpa - mx
+            cpa_y = py + vy * t_cpa - my
+            if cpa_x * cpa_x + cpa_y * cpa_y < 5.5 * 5.5:
+                spd = math.sqrt(spd2)
+                return (-vy / spd) * self.strafe_dir, (vx / spd) * self.strafe_dir
+        return None
+
     def act(self, obs: mf.Observation) -> mf.Action:
         t = obs["t"]
         me = obs["self"]
@@ -329,9 +404,15 @@ class Bot:
         self.last_pos = pos
 
         self.strafe_timer += 1
-        if self.strafe_timer > 16:
+        if self.strafe_timer > 15:
             self.strafe_timer = 0
             self.strafe_dir = -self.strafe_dir
+
+        # Hysteresis for regen mode: disengage below 48% HP, re-engage above 82% HP
+        if hp_frac < 0.48:
+            self.regen_mode = True
+        elif hp_frac > 0.82:
+            self.regen_mode = False
 
         action: mf.Action = {
             "tick": obs["tick"],
@@ -379,22 +460,28 @@ class Bot:
         pickups = obs.get("pickups", [])
         drops = obs.get("drops", [])
         zone = obs["zone"]
+        zc = zone["next_center"]
+        zr = zone["next_radius"]
 
-        # 4. Target Selection (prefer enemies with clear LOS, then closest/lowest HP)
+        # 4. Evaluate enemies & LOS count
+        los_enemies = []
+        scored_enemies = []
+        for e in enemies:
+            ep = e["pos"]
+            ec = (ep[0], ep[1], ep[2] + 4.5)
+            d = dist2d(pos, ep)
+            los = self.map.has_los(muzzle_pos, ec)
+            if los:
+                los_enemies.append(e)
+            hp_w = 0.55 + 0.45 * (e.get("hp", 1000) / max(e.get("max_hp", 1400), 1.0))
+            score = d * hp_w + (0.0 if los else 140.0)
+            scored_enemies.append((score, los, e))
+
         target = None
         target_type = None
         target_los = False
 
-        if enemies:
-            scored_enemies = []
-            for e in enemies:
-                ep = e["pos"]
-                ec = (ep[0], ep[1], ep[2] + 4.5)
-                d = dist2d(pos, ep)
-                los = self.map.has_los(muzzle_pos, ec)
-                hp_w = 0.65 + 0.35 * (e.get("hp", 1000) / max(e.get("max_hp", 1400), 1.0))
-                score = d * hp_w + (0.0 if los else 120.0)
-                scored_enemies.append((score, los, e))
+        if scored_enemies:
             scored_enemies.sort(key=lambda x: x[0])
             _, target_los, target = scored_enemies[0]
             target_type = "mech"
@@ -408,34 +495,62 @@ class Bot:
                 )
         if target is None and crates:
             nearest_crate = min(crates, key=lambda c: dist2d(pos, c["pos"]))
-            if dist2d(pos, nearest_crate["pos"]) < 65.0:
+            if dist2d(pos, nearest_crate["pos"]) < 70.0:
                 target = nearest_crate
                 target_type = "crate"
                 target_los = self.map.has_los(
                     muzzle_pos, (target["pos"][0], target["pos"][1], target["pos"][2] + 1.2)
                 )
 
+        # If target is almost dead (< 180 HP) and in LOS, finish them even in regen mode
+        finishing_kill = (
+            target_type == "mech" and target_los and target.get("hp", 1000) < 180.0
+        )
+        actively_regening = self.regen_mode and not finishing_kill
+
         # 5. Movement Decision
         move_x, move_y = 0.0, 0.0
         want_boost = False
 
-        zc = zone["next_center"]
-        zr = zone["next_radius"]
         d_zone = dist2d(pos, zc)
         outside_next = d_zone > max(zr - 18.0, 5.0)
         urgent_zone = (not me["in_zone"]) or (d_zone > zr - 8.0 and t > zone["shrink_start"] - 12.0)
 
+        # Check supply drops (full heal + 3 cubes!)
         best_drop = None
         for dr in drops:
-            if dr["lands_in"] < 12.0 and dist2d(pos, dr["pos"]) < 95.0:
-                if not enemies or dist2d(pos, dr["pos"]) < 25.0:
+            dd = dist2d(pos, dr["pos"])
+            if dr["lands_in"] < 18.0 and dd < (150.0 if (hp_frac < 0.75 or me["cubes"] < 8) else 95.0):
+                if len(los_enemies) == 0 or dd < 25.0:
                     best_drop = dr
                     break
 
         if urgent_zone:
             move_x = zc[0] - pos[0]
             move_y = zc[1] - pos[1]
-            want_boost = energy > 25.0
+            want_boost = energy > 22.0
+        elif actively_regening and enemies:
+            # Seek 0-LOS cover behind buildings to trigger 45 HP/s regen
+            cover_dir = self.map.find_cover_direction(pos, enemies, zc, zr, want_zero_los=True)
+            if cover_dir is not None:
+                move_x, move_y = cover_dir
+            else:
+                # Retreat away from nearest enemy
+                ne = min(enemies, key=lambda e: dist2d(pos, e["pos"]))
+                move_x = pos[0] - ne["pos"][0]
+                move_y = pos[1] - ne["pos"][1]
+            want_boost = energy > 20.0 and len(los_enemies) > 0
+        elif len(los_enemies) >= 2:
+            # Swarm alert: funnel enemies around cover so only 1 can shoot us
+            cover_dir = self.map.find_cover_direction(pos, enemies, zc, zr, want_zero_los=False)
+            if cover_dir is not None:
+                move_x, move_y = cover_dir
+                want_boost = energy > 25.0
+            else:
+                cx = sum(e["pos"][0] for e in los_enemies) / len(los_enemies)
+                cy = sum(e["pos"][1] for e in los_enemies) / len(los_enemies)
+                move_x, move_y = pos[0] - cx, pos[1] - cy
+                want_boost = energy > 25.0
         elif target_type == "mech":
             ex, ey = target["pos"][0], target["pos"][1]
             dx, dy = ex - pos[0], ey - pos[1]
@@ -444,60 +559,42 @@ class Bot:
             sx, sy = -ny * self.strafe_dir, nx * self.strafe_dir
 
             has_lightning = "lightning" in held_kinds
-            enemy_weapons = set(target.get("weapons", []))
-            # Close in if we have lightning (especially vs laser), otherwise mid-range kite
-            ideal_dist = 30.0 if (has_lightning and hp_frac > 0.42) else 65.0
-            if "laser" in enemy_weapons and has_lightning and hp_frac > 0.35:
-                ideal_dist = 28.0
+            ideal_dist = 32.0 if (has_lightning and hp_frac > 0.50) else 62.0
 
-            if hp_frac < 0.36:
-                move_x = -nx * 0.85 + sx * 0.55
-                move_y = -ny * 0.85 + sy * 0.55
-                want_boost = energy > 20.0
-            elif d > ideal_dist + 10.0:
+            if d > ideal_dist + 10.0:
                 move_x = nx * 0.65 + sx * 0.75
                 move_y = ny * 0.65 + sy * 0.75
-                want_boost = has_lightning and d < 65.0 and energy > 35.0
+                want_boost = has_lightning and d < 62.0 and energy > 38.0
             elif d < ideal_dist - 10.0:
                 move_x = -nx * 0.65 + sx * 0.75
                 move_y = -ny * 0.65 + sy * 0.75
             else:
                 move_x, move_y = sx, sy
 
-            # Dodge charging laser or close projectiles
             if target.get("charging"):
                 move_x, move_y = sx, sy
                 want_boost = energy > 15.0
-            for proj in obs.get("projectiles", []):
-                if dist2d(pos, proj["pos"]) < 28.0:
-                    pvx, pvy = proj["vel"][0], proj["vel"][1]
-                    pm = math.hypot(pvx, pvy)
-                    if pm > 1.0:
-                        move_x += (-pvy / pm) * self.strafe_dir * 0.9
-                        move_y += (pvx / pm) * self.strafe_dir * 0.9
-                        want_boost = energy > 20.0
-                        break
         elif cubes:
             c = min(cubes, key=lambda x: dist2d(pos, x["pos"]))
             move_x = c["pos"][0] - pos[0]
             move_y = c["pos"][1] - pos[1]
-            want_boost = energy > 50.0 and dist2d(pos, c["pos"]) > 15.0
+            want_boost = energy > 45.0 and dist2d(pos, c["pos"]) > 14.0
         elif empty_slot is not None and pickups:
             valid_p = [p for p in pickups if p["kind"] not in held_kinds]
             if valid_p:
                 p = min(valid_p, key=lambda x: dist2d(pos, x["pos"]))
                 move_x = p["pos"][0] - pos[0]
                 move_y = p["pos"][1] - pos[1]
-                want_boost = energy > 50.0
+                want_boost = energy > 45.0
         elif best_drop is not None:
             move_x = best_drop["pos"][0] - pos[0]
             move_y = best_drop["pos"][1] - pos[1]
-            want_boost = energy > 45.0 and dist2d(pos, best_drop["pos"]) > best_drop["radius"]
+            want_boost = energy > 40.0 and dist2d(pos, best_drop["pos"]) > best_drop["radius"]
         elif target_type in ("npc", "crate"):
             dx = target["pos"][0] - pos[0]
             dy = target["pos"][1] - pos[1]
             d = max(math.hypot(dx, dy), 1e-4)
-            if d > 30.0:
+            if d > 28.0:
                 move_x, move_y = dx, dy
             else:
                 move_x, move_y = -dy * self.strafe_dir, dx * self.strafe_dir
@@ -507,13 +604,20 @@ class Bot:
         else:
             if self.roam_target is None or dist2d(pos, self.roam_target) < 15.0:
                 ang = self.rng.uniform(0.0, 2.0 * math.pi)
-                rad = self.rng.uniform(0.15, 0.75) * max(zr - 15.0, 10.0)
+                rad = self.rng.uniform(0.15, 0.72) * max(zr - 15.0, 10.0)
                 self.roam_target = (
-                    clamp(zc[0] + math.cos(ang) * rad, self.bounds_x0(), self.bounds_x1()),
-                    clamp(zc[1] + math.sin(ang) * rad, self.bounds_y0(), self.bounds_y1()),
+                    clamp(zc[0] + math.cos(ang) * rad, self.map.bounds[0], self.map.bounds[1]),
+                    clamp(zc[1] + math.sin(ang) * rad, self.map.bounds[2], self.map.bounds[3]),
                 )
             move_x = self.roam_target[0] - pos[0]
             move_y = self.roam_target[1] - pos[1]
+
+        # Overlay true projectile dodge if something is about to hit us
+        dodge = self.incoming_projectile_dodge(pos, obs.get("projectiles", []))
+        if dodge is not None:
+            move_x = move_x * 0.35 + dodge[0] * 0.95
+            move_y = move_y * 0.35 + dodge[1] * 0.95
+            want_boost = energy > 18.0
 
         mx, my = self.map.steer_around_walls(pos, move_x, move_y)
         action["move"] = [round(mx, 4), round(my, 4)]
@@ -545,50 +649,55 @@ class Bot:
             des_yaw, des_pitch = self.aim_at_point(muzzle_pos, lead_pt)
             yaw_err = abs(angle_diff(des_yaw, cur_yaw))
 
+            # Hold fire ONLY if we are safely out of LOS in regen mode (so 5s regen timer runs!)
+            hold_fire_for_regen = actively_regening and len(los_enemies) == 0
+
             fire_flags = [False, False]
-            for s_idx, w in enumerate(weapons):
-                if w is None:
-                    continue
-                kind = w["kind"]
-                wstats = w.get("stats", {})
+            if not hold_fire_for_regen:
+                for s_idx, w in enumerate(weapons):
+                    if w is None:
+                        continue
+                    kind = w["kind"]
+                    wstats = w.get("stats", {})
 
-                if kind == "lightning":
-                    l_range = wstats.get("range", 45.0)
-                    if target_los and d_target <= l_range - 1.0 and yaw_err < 0.45 and energy > 8.0:
-                        fire_flags[s_idx] = True
-
-                elif kind == "gun":
-                    g_range = wstats.get("range", 230.0)
-                    if target_los and d_target <= g_range and yaw_err < 0.16 and w.get("reload", 0.0) <= 0.0:
-                        fire_flags[s_idx] = True
-
-                elif kind == "laser":
-                    l_range = wstats.get("range", 280.0)
-                    charge = w.get("charge", 0.0)
-                    full_charge = wstats.get("charge", 0.75)
-                    min_charge = wstats.get("min_charge", 0.15)
-                    if target_type == "mech" and target_los and d_target <= l_range:
-                        des_yaw, des_pitch = self.aim_at_point(muzzle_pos, aim_center)
-                        yaw_err = abs(angle_diff(des_yaw, cur_yaw))
-                        if charge == 0.0:
-                            if w.get("cooldown", 0.0) <= 0.0 and yaw_err < 0.45:
-                                fire_flags[s_idx] = True
-                        else:
-                            if (charge >= full_charge * 0.75 and yaw_err < 0.08) or (
-                                charge >= min_charge and target.get("hp", 1000) < 160 and yaw_err < 0.08
-                            ):
-                                fire_flags[s_idx] = False
-                            else:
-                                fire_flags[s_idx] = True
-
-                elif kind == "mortar":
-                    # Mortar can lob over buildings even without direct LOS
-                    if d_target <= 215.0 and d_target >= 18.0 and w.get("cooldown", 0.0) <= 0.0:
-                        m_speed = wstats.get("speed", 72.0)
-                        m_grav = wstats.get("gravity", 22.0)
-                        des_pitch = self.mortar_pitch(muzzle_pos, aim_center, m_speed, m_grav)
-                        if yaw_err < 0.15:
+                    if kind == "lightning":
+                        l_range = wstats.get("range", 45.0)
+                        if target_los and d_target <= l_range - 1.0 and yaw_err < 0.48 and energy > 6.0:
                             fire_flags[s_idx] = True
+
+                    elif kind == "gun":
+                        g_range = wstats.get("range", 230.0)
+                        if target_los and d_target <= g_range and yaw_err < 0.16 and w.get("reload", 0.0) <= 0.0:
+                            fire_flags[s_idx] = True
+
+                    elif kind == "laser":
+                        l_range = wstats.get("range", 280.0)
+                        charge = w.get("charge", 0.0)
+                        full_charge = wstats.get("charge", 0.75)
+                        min_charge = wstats.get("min_charge", 0.15)
+                        enemy_has_mortar = "mortar" in target.get("weapons", [])
+                        safe_to_charge = (len(los_enemies) <= 1 and d_target > 42.0) or enemy_has_mortar
+                        if target_type == "mech" and target_los and d_target <= l_range:
+                            des_yaw, des_pitch = self.aim_at_point(muzzle_pos, aim_center)
+                            yaw_err = abs(angle_diff(des_yaw, cur_yaw))
+                            if charge == 0.0:
+                                if safe_to_charge and w.get("cooldown", 0.0) <= 0.0 and yaw_err < 0.45:
+                                    fire_flags[s_idx] = True
+                            else:
+                                if (charge >= full_charge * 0.75 and yaw_err < 0.08) or (
+                                    charge >= min_charge and (target.get("hp", 1000) < 160 or d_target < 35.0) and yaw_err < 0.09
+                                ):
+                                    fire_flags[s_idx] = False
+                                else:
+                                    fire_flags[s_idx] = True
+
+                    elif kind == "mortar":
+                        if d_target <= 215.0 and d_target >= 20.0 and w.get("cooldown", 0.0) <= 0.0:
+                            m_speed = wstats.get("speed", 72.0)
+                            m_grav = wstats.get("gravity", 22.0)
+                            des_pitch = self.mortar_pitch(muzzle_pos, aim_center, m_speed, m_grav)
+                            if yaw_err < 0.15:
+                                fire_flags[s_idx] = True
 
             action["aim"] = [round(des_yaw, 4), round(des_pitch, 4)]
             action["fire"] = fire_flags
@@ -606,16 +715,12 @@ class Bot:
             for w in weapons:
                 if w and w["kind"] == "gun" and w.get("reload", 0.0) <= 0.0:
                     mag = w["stats"].get("mag", 12)
-                    if w.get("ammo", mag) < mag * 0.5:
+                    if w.get("ammo", mag) < mag * 0.6:
                         action["reload"] = True
 
-        mf.draw.label(f"hp {me['hp']:.0f} | cubes {me['cubes']} | {target_type or 'roam'}")
+        state = "REGEN" if actively_regening else ("SWARM" if len(los_enemies) >= 2 else (target_type or "ROAM"))
+        mf.draw.label(f"v2 | hp {me['hp']:.0f} | c {me['cubes']} | {state}")
         return action
-
-    def bounds_x0(self): return self.map.bounds[0]
-    def bounds_x1(self): return self.map.bounds[1]
-    def bounds_y0(self): return self.map.bounds[2]
-    def bounds_y1(self): return self.map.bounds[3]
 
 
 if __name__ == "__main__":
