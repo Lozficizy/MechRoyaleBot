@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-ApexMech v3.0 - Mech Royale Bot (mechfight/1)
-Ultra-fast (<2ms/tick), kill-focus cube snowball, anti-swarm kiting, dual-wield DPS.
+ApexMech v4.0 - Rooftop Camper & Edge-Peeker (mechfight/1)
+Finds climbable rooftops inside the next zone, jets onto them, stays silent,
+peeks edges to snipe, and steps back to roof center to trigger 45 HP/s regen.
 Standard library only.
 """
 import json
@@ -48,13 +49,26 @@ def point_in_ring(x: float, y: float, ring) -> bool:
     return inside
 
 
+def point_in_prism_2d(x: float, y: float, p: dict) -> bool:
+    minx, miny, maxx, maxy = p["bbox"]
+    if x < minx or x > maxx or y < miny or y > maxy:
+        return False
+    if not point_in_ring(x, y, p["ring"]):
+        return False
+    for h in p["holes"]:
+        if point_in_ring(x, y, h):
+            return False
+    return True
+
+
 class ArenaMap:
-    """Lightweight spatial-grid lookup for prisms (buildings/stadium/bridges)."""
+    """Spatial-grid lookup for prisms + precomputed campable rooftops."""
 
     def __init__(self, map_dir: str):
         self.cell_size = 45.0
         self.grid: dict[tuple[int, int], list[int]] = {}
         self.prisms: list[dict] = []
+        self.rooftops: list[dict] = []
         self.bounds = (-508.0, 551.0, -329.0, 384.0)
 
         world_path = os.path.join(map_dir, "v2", "world.json")
@@ -79,6 +93,7 @@ class ArenaMap:
                     minx, maxx = min(xs), max(xs)
                     miny, maxy = min(ys), max(ys)
                     prism = {
+                        "kind": p.get("kind", "building"),
                         "base": float(p.get("base", -100.0)),
                         "top": float(p.get("top", 100.0)),
                         "ring": ring,
@@ -94,6 +109,21 @@ class ArenaMap:
                     for cx in range(cx0, cx1 + 1):
                         for cy in range(cy0, cy1 + 1):
                             self.grid.setdefault((cx, cy), []).append(idx)
+
+                    # Precompute good campable rooftops (10m..32m tall, wide enough to step back)
+                    w = maxx - minx
+                    h = maxy - miny
+                    if prism["kind"] == "building" and 10.0 <= prism["top"] <= 32.0 and w >= 14.0 and h >= 14.0:
+                        cx = 0.5 * (minx + maxx)
+                        cy = 0.5 * (miny + maxy)
+                        if point_in_prism_2d(cx, cy, prism):
+                            self.rooftops.append({
+                                "idx": idx,
+                                "cx": cx,
+                                "cy": cy,
+                                "top": prism["top"],
+                                "prism": prism,
+                            })
             except Exception as e:
                 mf.log(f"[map] load error: {e}")
 
@@ -105,17 +135,8 @@ class ArenaMap:
             p = self.prisms[idx]
             if z < p["base"] or z > p["top"]:
                 continue
-            minx, miny, maxx, maxy = p["bbox"]
-            if x < minx or x > maxx or y < miny or y > maxy:
-                continue
-            if point_in_ring(x, y, p["ring"]):
-                in_hole = False
-                for h in p["holes"]:
-                    if point_in_ring(x, y, h):
-                        in_hole = True
-                        break
-                if not in_hole:
-                    return True
+            if point_in_prism_2d(x, y, p):
+                return True
         return False
 
     def is_blocked_body(self, x: float, y: float, z_feet: float, height: float = 9.0) -> bool:
@@ -129,21 +150,11 @@ class ArenaMap:
             p = self.prisms[idx]
             if z_top <= p["base"] or z_feet >= p["top"] - 1.2:
                 continue
-            minx, miny, maxx, maxy = p["bbox"]
-            if x < minx or x > maxx or y < miny or y > maxy:
-                continue
-            if point_in_ring(x, y, p["ring"]):
-                in_hole = False
-                for h in p["holes"]:
-                    if point_in_ring(x, y, h):
-                        in_hole = True
-                        break
-                if not in_hole:
-                    return True
+            if point_in_prism_2d(x, y, p):
+                return True
         return False
 
     def has_los(self, a, b) -> bool:
-        """Fast 3D LOS check (capped at 16 steps for <0.1ms runtime)."""
         d = dist3d(a, b)
         if d < 6.0:
             return True
@@ -175,9 +186,22 @@ class ArenaMap:
                 return ca, sa
         return desired_dx / mag, desired_dy / mag
 
+    def pick_best_rooftop(self, pos, zc, zr):
+        """Pick closest campable rooftop comfortably inside the next zone."""
+        safe_r = max(zr - 16.0, 8.0)
+        best = None
+        best_d = 1e9
+        for r in self.rooftops:
+            if dist2d((r["cx"], r["cy"]), zc) <= safe_r:
+                d = dist2d(pos, (r["cx"], r["cy"]))
+                if d < best_d:
+                    best_d = d
+                    best = r
+        return best
+
 
 class Bot:
-    name = "ApexMech-v3.0"
+    name = "ApexMech-v4.0"
 
     def __init__(self, hello: mf.Hello):
         self.slot = hello["slot"]
@@ -186,24 +210,24 @@ class Bot:
         self.map = ArenaMap(hello["map"]["dir"])
         self.pickup_r = self.config.get("loot", {}).get("pickup_radius", 4.0)
 
-        # Lightning is king vs stacked bots (chain + 240 DPS + shorts lasers)
-        self.weapon_rank = {"lightning": 4, "laser": 3, "gun": 2, "mortar": 1}
+        # Rooftop camper weapon priority: Laser (sniping) > Lightning (anti-rush) > Mortar > Gun
+        self.weapon_rank = {"laser": 5, "lightning": 4, "mortar": 3, "gun": 2}
 
-        # Survival + DPS upgrades
+        # Survival & regen upgrades first
         self.upgrade_weights = {
             "armor": 100,
+            "regen": 99,
             "hp": 97,
-            "regen": 95,
-            "lightning": 94,
-            "gun_rate": 91,
-            "gun_damage": 90,
-            "laser": 85,
-            "speed": 83,
+            "laser": 93,
+            "lightning": 92,
+            "gun_damage": 88,
+            "gun_rate": 87,
+            "energy": 84,
             "boost": 80,
-            "energy": 78,
-            "reload": 72,
-            "sensors": 60,
-            "mortar": 35,
+            "speed": 78,
+            "sensors": 75,
+            "reload": 70,
+            "mortar": 65,
         }
 
         self.last_pos = None
@@ -212,7 +236,9 @@ class Bot:
         self.strafe_timer = 0
         self.last_damage_bearing = None
         self.last_damage_t = -10.0
-        self.roam_target = None
+        self.regen_mode = False
+        self.climbing = False
+        self.target_roof = None
 
     def pick_upgrade(self, offer) -> int:
         best_i = 0
@@ -260,30 +286,6 @@ class Bot:
             return 0.78
         return clamp(math.atan((v2 - math.sqrt(disc)) / (gravity * r)), -0.5, 1.3)
 
-    def incoming_projectile_dodge(self, pos, projectiles):
-        mx, my = pos[0], pos[1]
-        for p in projectiles:
-            px, py = p["pos"][0], p["pos"][1]
-            vx, vy = p["vel"][0], p["vel"][1]
-            spd2 = vx * vx + vy * vy
-            if spd2 < 10.0:
-                continue
-            rx, ry = mx - px, my - py
-            if rx * rx + ry * ry > 42.0 * 42.0:
-                continue
-            dot = rx * vx + ry * vy
-            if dot <= 0.0:
-                continue
-            t_cpa = dot / spd2
-            if t_cpa > 0.6:
-                continue
-            cpa_x = px + vx * t_cpa - mx
-            cpa_y = py + vy * t_cpa - my
-            if cpa_x * cpa_x + cpa_y * cpa_y < 5.2 * 5.2:
-                spd = math.sqrt(spd2)
-                return (-vy / spd) * self.strafe_dir, (vx / spd) * self.strafe_dir
-        return None
-
     def act(self, obs: mf.Observation) -> mf.Action:
         t = obs["t"]
         me = obs["self"]
@@ -300,16 +302,22 @@ class Bot:
                 self.last_damage_bearing = ev["bearing"]
                 self.last_damage_t = t
 
-        if self.last_pos is not None and dist2d(pos, self.last_pos) < 0.25:
+        if self.last_pos is not None and dist2d(pos, self.last_pos) < 0.2:
             self.stuck_ticks += 1
         else:
             self.stuck_ticks = 0
         self.last_pos = pos
 
         self.strafe_timer += 1
-        if self.strafe_timer > 14:
+        if self.strafe_timer > 16:
             self.strafe_timer = 0
             self.strafe_dir = -self.strafe_dir
+
+        # Regen hysteresis: duck back to heal below 55% HP, re-peek above 88% HP
+        if hp_frac < 0.55:
+            self.regen_mode = True
+        elif hp_frac > 0.88:
+            self.regen_mode = False
 
         action: mf.Action = {
             "tick": obs["tick"],
@@ -325,7 +333,7 @@ class Bot:
         if obs.get("offer") is not None:
             action["pick"] = self.pick_upgrade(obs["offer"])
 
-        # 2. Auto-pickup / swap nearby weapon
+        # 2. Auto-pickup nearby weapon
         held_kinds = {w["kind"] for w in weapons if w is not None}
         empty_slot = 0 if weapons[0] is None else (1 if weapons[1] is None else None)
         for p in obs.get("pickups", []):
@@ -349,199 +357,169 @@ class Bot:
                     action["drop"] = worst_slot
                     break
 
-        # 3. Classify visible entities
-        enemies = [m for m in obs.get("mechs", []) if m["kind"] == "mech"]
-        npcs = [m for m in obs.get("mechs", []) if m["kind"] == "npc"]
-        crates = obs.get("crates", [])
-        cubes = obs.get("cubes", [])
-        pickups = obs.get("pickups", [])
-        drops = obs.get("drops", [])
+        # 3. Zone & Rooftop Selection
         zone = obs["zone"]
         zc = zone["next_center"]
         zr = zone["next_radius"]
 
-        # 4. Fast Target Selection (only raycast top 3 closest enemies)
-        target = None
-        target_type = None
-        target_los = False
-        near_enemies = []
+        if self.target_roof is None or dist2d((self.target_roof["cx"], self.target_roof["cy"]), zc) > max(zr - 12.0, 6.0):
+            self.target_roof = self.map.pick_best_rooftop(pos, zc, zr)
 
+        on_roof = False
+        if self.target_roof is not None:
+            if pos[2] >= self.target_roof["top"] - 1.8 and point_in_prism_2d(pos[0], pos[1], self.target_roof["prism"]):
+                on_roof = True
+                self.climbing = False
+
+        # 4. Classify visible enemies (ignore NPCs & crates while camping to stay quiet!)
+        enemies = [m for m in obs.get("mechs", []) if m["kind"] == "mech"]
+        cubes = obs.get("cubes", [])
+        pickups = obs.get("pickups", [])
+
+        target = None
+        target_los = False
+        enemies_with_los = 0
         if enemies:
             enemies.sort(key=lambda e: dist2d(pos, e["pos"]))
-            near_enemies = [e for e in enemies if dist2d(pos, e["pos"]) < 85.0]
             candidates = []
             for e in enemies[:3]:
                 ep = e["pos"]
                 d = dist2d(pos, ep)
                 los = self.map.has_los(muzzle_pos, (ep[0], ep[1], ep[2] + 4.5))
-                # Strongly prioritize low-HP enemies to secure kills & cube heals!
+                if los:
+                    enemies_with_los += 1
                 hp_ratio = e.get("hp", 1000.0) / max(e.get("max_hp", 1400.0), 1.0)
-                score = d * (0.4 + 0.6 * hp_ratio) + (0.0 if los else 150.0)
+                score = d * (0.45 + 0.55 * hp_ratio) + (0.0 if los else 140.0)
                 candidates.append((score, los, e))
             candidates.sort(key=lambda x: x[0])
             _, target_los, target = candidates[0]
-            target_type = "mech"
-        elif npcs:
-            nearest_npc = min(npcs, key=lambda n: dist2d(pos, n["pos"]))
-            if dist2d(pos, nearest_npc["pos"]) < 90.0:
-                target = nearest_npc
-                target_type = "npc"
-                target_los = self.map.has_los(
-                    muzzle_pos, (target["pos"][0], target["pos"][1], target["pos"][2] + 1.8)
-                )
-        if target is None and crates:
-            nearest_crate = min(crates, key=lambda c: dist2d(pos, c["pos"]))
-            if dist2d(pos, nearest_crate["pos"]) < 75.0:
-                target = nearest_crate
-                target_type = "crate"
-                target_los = self.map.has_los(
-                    muzzle_pos, (target["pos"][0], target["pos"][1], target["pos"][2] + 1.2)
-                )
 
-        # 5. Movement Decision
+        # 5. Movement: Roof Camp > Climb Roof > Silent Rotate
         move_x, move_y = 0.0, 0.0
         want_boost = False
+        want_jump = False
+        silent_walk = False
 
         d_zone = dist2d(pos, zc)
-        outside_next = d_zone > max(zr - 18.0, 5.0)
         urgent_zone = (not me["in_zone"]) or (d_zone > zr - 8.0 and t > zone["shrink_start"] - 12.0)
-
-        # Nearby cube for instant heal + damage buff
-        near_cube = None
-        if cubes:
-            c = min(cubes, key=lambda x: dist2d(pos, x["pos"]))
-            if dist2d(pos, c["pos"]) < (32.0 if enemies else 90.0):
-                near_cube = c
-
-        # Nearby lightning pickup (highest priority weapon)
-        near_lightning = None
-        if "lightning" not in held_kinds and pickups:
-            lp = [p for p in pickups if p["kind"] == "lightning"]
-            if lp:
-                p = min(lp, key=lambda x: dist2d(pos, x["pos"]))
-                if dist2d(pos, p["pos"]) < (40.0 if enemies else 110.0):
-                    near_lightning = p
-
-        # Supply drop (full heal + 3 cubes)
-        best_drop = None
-        for dr in drops:
-            dd = dist2d(pos, dr["pos"])
-            if dr["lands_in"] < 16.0 and dd < (140.0 if (hp_frac < 0.72 or me["cubes"] < 6) else 90.0):
-                if len(near_enemies) == 0 or dd < 24.0:
-                    best_drop = dr
-                    break
 
         if urgent_zone:
             move_x = zc[0] - pos[0]
             move_y = zc[1] - pos[1]
             want_boost = energy > 22.0
-        elif near_cube is not None and (not near_enemies or dist2d(pos, near_cube["pos"]) < 18.0):
-            move_x = near_cube["pos"][0] - pos[0]
-            move_y = near_cube["pos"][1] - pos[1]
-            want_boost = energy > 35.0
-        elif near_lightning is not None and (not near_enemies or dist2d(pos, near_lightning["pos"]) < 22.0):
-            move_x = near_lightning["pos"][0] - pos[0]
-            move_y = near_lightning["pos"][1] - pos[1]
-            want_boost = energy > 35.0
-        elif target_type == "mech":
-            has_lightning = "lightning" in held_kinds
-            if len(near_enemies) >= 2:
-                # Anti-swarm kiting: backpedal away from the pack's centroid while strafing
-                cx = sum(e["pos"][0] for e in near_enemies) / len(near_enemies)
-                cy = sum(e["pos"][1] for e in near_enemies) / len(near_enemies)
-                dx, dy = pos[0] - cx, pos[1] - cy
-                d = max(math.hypot(dx, dy), 1e-4)
-                nx, ny = dx / d, dy / d
-                sx, sy = -ny * self.strafe_dir, nx * self.strafe_dir
-                # Pull slightly toward zone center so we don't back into a dead-end corner
-                zx, zy = zc[0] - pos[0], zc[1] - pos[1]
-                zm = max(math.hypot(zx, zy), 1e-4)
-                move_x = nx * 0.75 + sx * 0.55 + (zx / zm) * 0.25
-                move_y = ny * 0.75 + sy * 0.55 + (zy / zm) * 0.25
-                want_boost = energy > 28.0 and dist2d(pos, near_enemies[0]["pos"]) < 36.0
-            else:
+        elif on_roof:
+            rcx, rcy = self.target_roof["cx"], self.target_roof["cy"]
+            d_center = dist2d(pos, (rcx, rcy))
+            # Check if a cube or weapon is right on our roof
+            roof_loot = None
+            for c in cubes:
+                if abs(c["pos"][2] - pos[2]) < 3.0 and dist2d(pos, c["pos"]) < 18.0 and point_in_prism_2d(c["pos"][0], c["pos"][1], self.target_roof["prism"]):
+                    roof_loot = c["pos"]
+                    break
+            if roof_loot is None and empty_slot is not None:
+                for p in pickups:
+                    if p["kind"] not in held_kinds and abs(p["pos"][2] - pos[2]) < 3.0 and dist2d(pos, p["pos"]) < 18.0 and point_in_prism_2d(p["pos"][0], p["pos"][1], self.target_roof["prism"]):
+                        roof_loot = p["pos"]
+                        break
+
+            if self.regen_mode:
+                # Retreat to roof center to break LOS from ground enemies & heal at 45 HP/s!
+                if d_center > 3.0:
+                    move_x, move_y = rcx - pos[0], rcy - pos[1]
+                    want_boost = enemies_with_los > 0 and energy > 20.0
+            elif roof_loot is not None and enemies_with_los == 0:
+                move_x, move_y = roof_loot[0] - pos[0], roof_loot[1] - pos[1]
+                silent_walk = True
+            elif target is not None:
+                # Stay safely on the roof: strafe if we have LOS, or stay near center
                 ex, ey = target["pos"][0], target["pos"][1]
                 dx, dy = ex - pos[0], ey - pos[1]
                 d = max(math.hypot(dx, dy), 1e-4)
-                nx, ny = dx / d, dy / d
-                sx, sy = -ny * self.strafe_dir, nx * self.strafe_dir
-
-                ideal_dist = 36.0 if (has_lightning and hp_frac > 0.35) else 68.0
-                if d > ideal_dist + 8.0:
-                    move_x = nx * 0.65 + sx * 0.75
-                    move_y = ny * 0.65 + sy * 0.75
-                    want_boost = has_lightning and d < 62.0 and energy > 40.0
-                elif d < ideal_dist - 8.0:
-                    move_x = -nx * 0.70 + sx * 0.70
-                    move_y = -ny * 0.70 + sy * 0.70
-                    want_boost = hp_frac < 0.45 and energy > 25.0
+                if target_los:
+                    # Gentle strafe that stays inside the roof polygon
+                    sx, sy = (-dy / d) * self.strafe_dir, (dx / d) * self.strafe_dir
+                    if point_in_prism_2d(pos[0] + sx * 4.0, pos[1] + sy * 4.0, self.target_roof["prism"]):
+                        move_x, move_y = sx, sy
+                    else:
+                        self.strafe_dir = -self.strafe_dir
+                        move_x, move_y = rcx - pos[0], rcy - pos[1]
+                    if target.get("charging"):
+                        want_boost = energy > 20.0
                 else:
-                    move_x, move_y = sx, sy
-
-            if target.get("charging"):
-                ex, ey = target["pos"][0], target["pos"][1]
-                dx, dy = ex - pos[0], ey - pos[1]
-                d = max(math.hypot(dx, dy), 1e-4)
-                move_x, move_y = (-dy / d) * self.strafe_dir, (dx / d) * self.strafe_dir
-                want_boost = energy > 15.0
-        elif empty_slot is not None and pickups:
-            valid_p = [p for p in pickups if p["kind"] not in held_kinds]
-            if valid_p:
-                p = min(valid_p, key=lambda x: dist2d(pos, x["pos"]))
-                move_x = p["pos"][0] - pos[0]
-                move_y = p["pos"][1] - pos[1]
-                want_boost = energy > 45.0
-        elif best_drop is not None:
-            move_x = best_drop["pos"][0] - pos[0]
-            move_y = best_drop["pos"][1] - pos[1]
-            want_boost = energy > 40.0 and dist2d(pos, best_drop["pos"]) > best_drop["radius"]
-        elif target_type in ("npc", "crate"):
-            dx = target["pos"][0] - pos[0]
-            dy = target["pos"][1] - pos[1]
-            d = max(math.hypot(dx, dy), 1e-4)
-            if d > 28.0:
-                move_x, move_y = dx, dy
+                    # Inch toward enemy only if still safely 3.5m inside roof
+                    nx, ny = dx / d, dy / d
+                    if point_in_prism_2d(pos[0] + nx * 4.0, pos[1] + ny * 4.0, self.target_roof["prism"]):
+                        move_x, move_y = nx, ny
+                        silent_walk = True
             else:
-                move_x, move_y = -dy * self.strafe_dir, dx * self.strafe_dir
-        elif outside_next:
-            move_x = zc[0] - pos[0]
-            move_y = zc[1] - pos[1]
+                # Pure silent camp at roof center
+                if d_center > 4.0:
+                    move_x, move_y = rcx - pos[0], rcy - pos[1]
+                    silent_walk = True
+        elif self.target_roof is not None:
+            # Move toward target rooftop and jet up when we reach its wall
+            rcx, rcy = self.target_roof["cx"], self.target_roof["cy"]
+            dx, dy = rcx - pos[0], rcy - pos[1]
+            d = max(math.hypot(dx, dy), 1e-4)
+            nx, ny = dx / d, dy / d
+
+            # Check if the target roof's wall is right in front of us
+            hitting_target_wall = point_in_prism_2d(pos[0] + nx * 4.5, pos[1] + ny * 4.5, self.target_roof["prism"])
+            if hitting_target_wall and pos[2] < self.target_roof["top"] - 0.5:
+                if energy >= 45.0 or self.climbing:
+                    self.climbing = True
+                    move_x, move_y = nx, ny
+                    if me["grounded"]:
+                        want_jump = True
+                    else:
+                        want_boost = energy > 5.0
+                else:
+                    # Wait briefly at base of wall to recharge energy before jetting up
+                    self.climbing = False
+                    move_x, move_y = 0.0, 0.0
+            else:
+                self.climbing = False
+                move_x, move_y = nx, ny
+                # Walk silently if no enemy is shooting at us
+                if enemies_with_los == 0 and d_zone < zr - 15.0:
+                    silent_walk = True
+                elif enemies_with_los > 0:
+                    want_boost = energy > 30.0
         else:
-            if self.roam_target is None or dist2d(pos, self.roam_target) < 15.0:
-                ang = self.rng.uniform(0.0, 2.0 * math.pi)
-                rad = self.rng.uniform(0.15, 0.72) * max(zr - 15.0, 10.0)
-                self.roam_target = (
-                    clamp(zc[0] + math.cos(ang) * rad, self.map.bounds[0], self.map.bounds[1]),
-                    clamp(zc[1] + math.sin(ang) * rad, self.map.bounds[2], self.map.bounds[3]),
-                )
-            move_x = self.roam_target[0] - pos[0]
-            move_y = self.roam_target[1] - pos[1]
+            # Fallback if no roof in tiny final circle: hold near zone center silently
+            if d_zone > 8.0:
+                move_x, move_y = zc[0] - pos[0], zc[1] - pos[1]
+                silent_walk = enemies_with_los == 0
 
-        dodge = self.incoming_projectile_dodge(pos, obs.get("projectiles", []))
-        if dodge is not None:
-            move_x = move_x * 0.35 + dodge[0] * 0.95
-            move_y = move_y * 0.35 + dodge[1] * 0.95
-            want_boost = energy > 18.0
+        # Apply wall steering (unless actively climbing our target roof)
+        if self.climbing:
+            mag = max(math.hypot(move_x, move_y), 1e-4)
+            mx, my = move_x / mag, move_y / mag
+        else:
+            mx, my = self.map.steer_around_walls(pos, move_x, move_y)
+            if silent_walk:
+                # 0.40 * 11.7 m/s = 4.68 m/s < 5.0 m/s -> 100% SILENT!
+                mx *= 0.40
+                my *= 0.40
 
-        mx, my = self.map.steer_around_walls(pos, move_x, move_y)
         action["move"] = [round(mx, 4), round(my, 4)]
         action["boost"] = want_boost
-        if self.stuck_ticks >= 4:
+        action["jump"] = want_jump
+
+        if not self.climbing and self.stuck_ticks >= 5 and (abs(mx) > 0.1 or abs(my) > 0.1):
             if me["grounded"]:
                 action["jump"] = True
             elif energy > 25.0:
                 action["boost"] = True
-            if self.stuck_ticks >= 10:
+            if self.stuck_ticks >= 12:
                 self.strafe_dir = -self.strafe_dir
-                self.roam_target = None
                 self.stuck_ticks = 0
 
         # 6. Aiming & Firing
         if target is not None:
             tpos = target["pos"]
             tvel = target.get("vel", [0.0, 0.0, 0.0])
-            z_off = 4.5 if target_type == "mech" else (1.8 if target_type == "npc" else 1.2)
-            aim_center = (tpos[0], tpos[1], tpos[2] + z_off)
+            aim_center = (tpos[0], tpos[1], tpos[2] + 4.5)
             d_target = dist3d(muzzle_pos, aim_center)
 
             gun_speed = 252.0
@@ -549,53 +527,52 @@ class Bot:
                 if w and w["kind"] == "gun":
                     gun_speed = w["stats"].get("speed", 252.0)
 
-            lead_pt = self.lead_target(muzzle_pos, aim_center, tvel, gun_speed) if target_type != "crate" else aim_center
+            lead_pt = self.lead_target(muzzle_pos, aim_center, tvel, gun_speed)
             des_yaw, des_pitch = self.aim_at_point(muzzle_pos, lead_pt)
             yaw_err = abs(angle_diff(des_yaw, cur_yaw))
 
+            # Hold fire in regen_mode if enemy cannot see us (lets 45 HP/s regen tick!)
+            hold_fire = self.regen_mode and enemies_with_los == 0
+
             fire_flags = [False, False]
-            for s_idx, w in enumerate(weapons):
-                if w is None:
-                    continue
-                kind = w["kind"]
-                wstats = w.get("stats", {})
+            if not hold_fire:
+                for s_idx, w in enumerate(weapons):
+                    if w is None:
+                        continue
+                    kind = w["kind"]
+                    wstats = w.get("stats", {})
 
-                if kind == "lightning":
-                    l_range = wstats.get("range", 45.0)
-                    if target_los and d_target <= l_range - 1.0 and yaw_err < 0.48 and energy > 5.0:
-                        fire_flags[s_idx] = True
-
-                elif kind == "gun":
-                    g_range = wstats.get("range", 230.0)
-                    if target_los and d_target <= g_range and yaw_err < 0.16 and w.get("reload", 0.0) <= 0.0:
-                        fire_flags[s_idx] = True
-
-                elif kind == "laser":
-                    l_range = wstats.get("range", 280.0)
-                    charge = w.get("charge", 0.0)
-                    full_charge = wstats.get("charge", 0.75)
-                    min_charge = wstats.get("min_charge", 0.15)
-                    if target_type == "mech" and target_los and d_target <= l_range:
-                        des_yaw, des_pitch = self.aim_at_point(muzzle_pos, aim_center)
-                        yaw_err = abs(angle_diff(des_yaw, cur_yaw))
-                        if charge == 0.0:
-                            if w.get("cooldown", 0.0) <= 0.0 and yaw_err < 0.45 and (d_target > 40.0 or "mortar" in target.get("weapons", [])):
-                                fire_flags[s_idx] = True
-                        else:
-                            if (charge >= full_charge * 0.72 and yaw_err < 0.08) or (
-                                charge >= min_charge and (target.get("hp", 1000) < 160 or d_target < 35.0) and yaw_err < 0.09
-                            ):
-                                fire_flags[s_idx] = False
-                            else:
-                                fire_flags[s_idx] = True
-
-                elif kind == "mortar":
-                    if d_target <= 215.0 and d_target >= 20.0 and w.get("cooldown", 0.0) <= 0.0:
-                        m_speed = wstats.get("speed", 72.0)
-                        m_grav = wstats.get("gravity", 22.0)
-                        des_pitch = self.mortar_pitch(muzzle_pos, aim_center, m_speed, m_grav)
-                        if yaw_err < 0.15:
+                    if kind == "lightning":
+                        if target_los and d_target <= wstats.get("range", 45.0) - 1.0 and yaw_err < 0.48 and energy > 8.0:
                             fire_flags[s_idx] = True
+
+                    elif kind == "gun":
+                        if target_los and d_target <= wstats.get("range", 230.0) and yaw_err < 0.16 and w.get("reload", 0.0) <= 0.0:
+                            fire_flags[s_idx] = True
+
+                    elif kind == "laser":
+                        charge = w.get("charge", 0.0)
+                        full_charge = wstats.get("charge", 0.75)
+                        min_charge = wstats.get("min_charge", 0.15)
+                        if target_los and d_target <= wstats.get("range", 280.0):
+                            des_yaw, des_pitch = self.aim_at_point(muzzle_pos, aim_center)
+                            yaw_err = abs(angle_diff(des_yaw, cur_yaw))
+                            if charge == 0.0:
+                                if w.get("cooldown", 0.0) <= 0.0 and yaw_err < 0.45:
+                                    fire_flags[s_idx] = True
+                            else:
+                                if (charge >= full_charge * 0.75 and yaw_err < 0.08) or (
+                                    charge >= min_charge and target.get("hp", 1000) < 160 and yaw_err < 0.09
+                                ):
+                                    fire_flags[s_idx] = False
+                                else:
+                                    fire_flags[s_idx] = True
+
+                    elif kind == "mortar":
+                        if d_target <= 215.0 and d_target >= 18.0 and w.get("cooldown", 0.0) <= 0.0:
+                            des_pitch = self.mortar_pitch(muzzle_pos, aim_center, wstats.get("speed", 72.0), wstats.get("gravity", 22.0))
+                            if yaw_err < 0.15:
+                                fire_flags[s_idx] = True
 
             action["aim"] = [round(des_yaw, 4), round(des_pitch, 4)]
             action["fire"] = fire_flags
@@ -607,15 +584,16 @@ class Bot:
                 if near_sounds:
                     action["aim"] = [round(near_sounds[0]["bearing"], 4), 0.0]
             else:
-                action["aim"] = [round(wrap_angle(cur_yaw + 0.35), 4), 0.0]
+                action["aim"] = [round(wrap_angle(cur_yaw + 0.3), 4), 0.0]
 
             for w in weapons:
                 if w and w["kind"] == "gun" and w.get("reload", 0.0) <= 0.0:
                     mag = w["stats"].get("mag", 12)
-                    if w.get("ammo", mag) < mag * 0.6:
+                    if w.get("ammo", mag) < mag:
                         action["reload"] = True
 
-        mf.draw.label(f"v3 | hp {me['hp']:.0f} | c {me['cubes']} | {target_type or 'roam'}")
+        mode = "ROOF-REGEN" if (on_roof and self.regen_mode) else ("ROOF-CAMP" if on_roof else ("CLIMB" if self.climbing else "ROTATE"))
+        mf.draw.label(f"v4 | hp {me['hp']:.0f} | {mode}")
         return action
 
 
