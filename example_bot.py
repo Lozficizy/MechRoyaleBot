@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-ApexMech v26.0 - Max-Aggression Thanos Edition (Built on V18's 4.42 core)
-- All V25 traps fixed (outgunned deleted, HEAL_HIDE off by default)
-- Tighter 24m Lightning backstab orbit, 18% HP retreat floor, aggressive boost-chasing
-- 1v2 angle-splitting tuned to stay in Lightning chain range when healthy
-- Kill-lock + execute focus + LASER_DODGE + AVOID_MORTAR + DROP_HOLD + DEBUG_DRAW
+ApexMech v27.0 - Perimeter Loop Sweeper (Built on V18's 4.42 core)
+- Continuously loops the outer edge of the next safe zone (back to the storm)
+- Kills any isolated encounter along the loop with 1.5x rear-armor backstabbing
+- Refuses to dive deep into the center meat-grinder; flips loop direction around packs
+- Keeps LASER_DODGE, AVOID_MORTAR, DROP_HOLD, and DEBUG_DRAW
 Standard library only. (<1.5ms/tick)
 """
 import json
@@ -13,23 +13,16 @@ import os
 import random
 import mechfight as mf
 
-# ---------------- A/B FLAGS ----------------
-HEAL_HIDE = False           # OFF for max aggression (traps fixed if you ever toggle True)
-HEAL_ENTER_FRAC = 0.35
-HEAL_EXIT_FRAC = 0.72
-EVADE_ENABLED = False       # OFF: V18 angle-split + aggression handles swarms
-NO_CHASE = False            # OFF: hunt everything
-CHASE_MAX = 110.0
-LIGHTNING_RESERVE = False   # OFF: dump 100% Lightning DPS
+# ---------------- TUNING FLAGS ----------------
+LOOP_RADIUS_FRAC = 0.84     # orbit at 84% of next_radius (hugging the safe edge)
+CENTER_AVOID_FRAC = 0.45    # don't dive into the inner 45% of the zone for far targets
 LASER_DODGE = True          # sidestep any charging laser aimed at us
 AVOID_MORTAR = True         # never pick up mortars
 DROP_HOLD = True            # stop inside a supply-drop ring instead of oscillating
-GATED_RUSH = False
-EARLY_PASSIVE_S = 0.0
-STRAFE_PERIOD = (5, 8)
+STRAFE_PERIOD = (6, 9)
 LOGGING = True
-DEBUG_DRAW = True           # replay overlay: state + LOS lines (red = sees you)
-# -------------------------------------------
+DEBUG_DRAW = True           # shows loop waypoint (green) + enemy LOS lines
+# ----------------------------------------------
 
 TWO_PI = 6.283185307179586
 
@@ -183,42 +176,9 @@ class ArenaMap:
                 return ca, sa
         return desired_dx / mag, desired_dy / mag
 
-    def evade_direction(self, pos, muzzle_h: float, threats, zc, zr: float, prev_dir):
-        x, y, z = pos[0], pos[1], pos[2]
-        safe_r = max(zr - 12.0, 8.0)
-        best_s, best_d = -1e9, None
-        for i in range(16):
-            a = i * (TWO_PI / 16)
-            ca, sa = math.cos(a), math.sin(a)
-            if self.is_blocked_body(x + ca * 5.0, y + sa * 5.0, z):
-                continue
-            nx, ny = x + ca * 14.0, y + sa * 14.0
-            if self.is_blocked_body(nx, ny, z):
-                continue
-            cm = (nx, ny, z + muzzle_h)
-            s = 0.0
-            for e in threats[:5]:
-                ep = e["pos"]
-                old_d = math.hypot(x - ep[0], y - ep[1])
-                new_d = math.hypot(nx - ep[0], ny - ep[1])
-                if new_d < 170.0:
-                    if self.has_los(cm, (ep[0], ep[1], ep[2] + 4.5), max_steps=7):
-                        s -= 60.0 + max(0.0, 80.0 - new_d) * 0.8
-                    else:
-                        s += 45.0
-                s += clamp(new_d - old_d, -10.0, 14.0) * 1.5
-            dz = math.hypot(nx - zc[0], ny - zc[1])
-            if dz > safe_r:
-                s -= (dz - safe_r) * 3.0
-            if prev_dir is not None and ca * prev_dir[0] + sa * prev_dir[1] > 0.7:
-                s += 15.0
-            if s > best_s:
-                best_s, best_d = s, (ca, sa)
-        return best_d
-
 
 class Bot:
-    name = "ApexMech-v26.0"
+    name = "ApexMech-v27.0"
 
     def __init__(self, hello: mf.Hello):
         self.slot = hello["slot"]
@@ -226,26 +186,21 @@ class Bot:
         self.config = hello["config"]
         self.map = ArenaMap(hello["map"]["dir"])
         self.pickup_r = self.config.get("loot", {}).get("pickup_radius", 4.0)
-        vis = self.config.get("vision", {})
-        self.fov_half = math.radians(float(vis.get("fov_deg", 120.0))) * 0.5
-        self.vis_range = float(vis.get("range", 200.0))
-        self.near_r = float(vis.get("near_range", 45.0))
 
         self.weapon_rank = {"lightning": 5, "gun": 4, "laser": 3, "mortar": 1}
-        # Max-aggression DPS + brawling survivability
         self.upgrade_weights = {
             "armor": 100,
-            "lightning": 99,
-            "gun_rate": 98,
-            "gun_damage": 97,
-            "hp": 96,
+            "lightning": 98,
+            "hp": 97,
+            "gun_rate": 96,
+            "gun_damage": 95,
             "speed": 94,
-            "reload": 92,
-            "boost": 90,
-            "energy": 89,
-            "regen": 85,
+            "reload": 90,
+            "regen": 89,
+            "boost": 87,
+            "energy": 85,
             "laser": 78,
-            "sensors": 60,
+            "sensors": 62,
             "mortar": 30,
         }
 
@@ -253,21 +208,15 @@ class Bot:
         self.stuck_ticks = 0
         self.strafe_dir = 1.0
         self.strafe_timer = 0
-        self.strafe_period = 6
+        self.strafe_period = 7
         self.last_damage_bearing = None
         self.last_damage_t = -10.0
-        self.last_hit_t = -10.0
-        self.roam_target = None
         self.locked_id = None
 
-        self.mode = "fight"
-        self.evade_until = 0.0
-        self.prev_evade_dir = None
-        self.heal = False
-        self.heal_since = 0.0
+        # Perimeter loop state (+1 = CCW, -1 = CW)
+        self.loop_dir = 1.0 if self.rng.random() < 0.5 else -1.0
         self._last_log = -9.0
 
-    # ------------------------------------------------------------------ helpers
     def pick_upgrade(self, offer) -> int:
         best_i, best_score = 0, -1e9
         for i, ch in enumerate(offer.get("choices", [])):
@@ -311,21 +260,7 @@ class Bot:
             return 0.78
         return clamp(math.atan((v2 - math.sqrt(disc)) / (gravity * r)), -0.5, 1.3)
 
-    def enemy_sees_me(self, e, pos) -> bool:
-        ep = e["pos"]
-        d = dist2d(pos, ep)
-        if d > self.vis_range:
-            return False
-        if not self.map.has_los((ep[0], ep[1], ep[2] + 8.0), (pos[0], pos[1], pos[2] + 4.5), max_steps=10):
-            return False
-        if d <= self.near_r:
-            return True
-        yaw = e.get("aim", [0.0, 0.0])[0]
-        bearing = math.atan2(pos[1] - ep[1], pos[0] - ep[0])
-        return abs(angle_diff(bearing, yaw)) <= self.fov_half
-
     def laser_dodge(self, pos, enemies):
-        """If an enemy is charging a laser along a line through us, step sideways off that line."""
         for e in enemies:
             if not e.get("charging"):
                 continue
@@ -346,7 +281,16 @@ class Bot:
                 return (-dy * sgn, dx * sgn)
         return None
 
-    # --------------------------------------------------------------------- act
+    def compute_loop_waypoint(self, pos, zc, zr):
+        """Returns a point ~35m ahead along the outer perimeter of the next safe zone."""
+        loop_r = max(min(zr - 16.0, zr * LOOP_RADIUS_FRAC), 10.0)
+        cur_ang = math.atan2(pos[1] - zc[1], pos[0] - zc[0])
+        step_ang = clamp(38.0 / max(loop_r, 15.0), 0.18, 0.75)
+        next_ang = cur_ang + self.loop_dir * step_ang
+        wx = clamp(zc[0] + math.cos(next_ang) * loop_r, self.map.bounds[0] + 8.0, self.map.bounds[1] - 8.0)
+        wy = clamp(zc[1] + math.sin(next_ang) * loop_r, self.map.bounds[2] + 8.0, self.map.bounds[3] - 8.0)
+        return (wx, wy)
+
     def act(self, obs: mf.Observation) -> mf.Action:
         t = obs["t"]
         me = obs["self"]
@@ -364,8 +308,6 @@ class Bot:
         for ev in obs.get("events", []):
             if ev.get("type") == "damaged":
                 took_hit = True
-                if ev.get("weapon") != "zone":
-                    self.last_hit_t = t
                 if ev.get("bearing") is not None:
                     self.last_damage_bearing = ev["bearing"]
                     self.last_damage_t = t
@@ -436,7 +378,7 @@ class Bot:
         zc = zone["next_center"]
         zr = zone["next_radius"]
 
-        # 4. Aggressive Target Selection (Kill-Lock + Execute + 1.5x Backstab)
+        # 4. Target Selection (Kill-Lock + Execute + 1.5x Backstab)
         enemies.sort(key=lambda e: dist2d(pos, e["pos"]))
         near_enemies = [e for e in enemies if dist2d(pos, e["pos"]) < 85.0]
         target = None
@@ -450,13 +392,13 @@ class Bot:
                 d = dist2d(pos, ep)
                 los = self.map.has_los(muzzle_pos, (ep[0], ep[1], ep[2] + 4.5))
                 hp = e.get("hp", 1000.0)
-                hp_w = 0.40 + 0.60 * (hp / max(e.get("max_hp", 1400.0), 1.0))
+                hp_w = 0.42 + 0.58 * (hp / max(e.get("max_hp", 1400.0), 1.0))
 
                 e_yaw = e.get("aim", [0.0, 0.0])[0]
                 back_err = abs(angle_diff(math.atan2(pos[1] - ep[1], pos[0] - ep[0]), e_yaw))
-                backstab_bonus = -32.0 if (los and back_err > 1.45) else 0.0
-                exec_bonus = -40.0 if (los and hp < 400.0) else 0.0
-                lock_bonus = -28.0 if (los and e["id"] == self.locked_id) else 0.0
+                backstab_bonus = -30.0 if (los and back_err > 1.45) else 0.0
+                exec_bonus = -35.0 if (los and hp < 360.0) else 0.0
+                lock_bonus = -25.0 if (los and e["id"] == self.locked_id) else 0.0
 
                 scored.append((d * hp_w + backstab_bonus + exec_bonus + lock_bonus + (0.0 if los else 130.0), los, e))
             scored.sort(key=lambda x: x[0])
@@ -466,6 +408,7 @@ class Bot:
         else:
             self.locked_id = None
 
+        # Farm outer NPCs/crates along the loop when no close enemy (<65m)
         if (target is None or (my_cubes < 15 and dist2d(pos, target["pos"]) > 65.0)) and npcs:
             n = min(npcs, key=lambda x: dist2d(pos, x["pos"]))
             if dist2d(pos, n["pos"]) < 95.0:
@@ -479,141 +422,68 @@ class Bot:
                 if c_los or target is None:
                     target, target_type, target_los = c, "crate", c_los
 
-        # 4b. Situation assessment
-        n_close = sum(1 for e in enemies if dist2d(pos, e["pos"]) < 80.0)
-        n_seen = sum(1 for e in enemies if dist2d(pos, e["pos"]) < 130.0)
-        nearest_d = dist2d(pos, enemies[0]["pos"]) if enemies else 1e9
-        recent_hit = (t - self.last_hit_t) < 1.5
-        t_dist = dist2d(pos, target["pos"]) if target_type == "mech" else 0.0
-
-        if EVADE_ENABLED:
-            want_evade = n_close >= 3 or n_seen >= 4 or (hp_frac < 0.35 and n_close >= 2)
-            if want_evade:
-                self.mode = "evade"
-                self.evade_until = t + 2.0
-            elif self.mode == "evade" and t > self.evade_until:
-                self.mode = "fight"
-        threats = [e for e in enemies if dist2d(pos, e["pos"]) < 170.0]
-        evading = EVADE_ENABLED and self.mode == "evade" and bool(threats)
-
-        # Fixed Heal / hide (OFF by default; no cowardly `outgunned` trigger)
-        exposed = False
-        if HEAL_HIDE:
-            if self.heal:
-                if hp_frac >= HEAL_EXIT_FRAC or (t - self.heal_since) > 18.0:
-                    self.heal = False
-            else:
-                finishing = (
-                    target_type == "mech"
-                    and n_close <= 1
-                    and target.get("hp", 1e9) < 300.0
-                    and t_dist < 48.0
-                    and hp_frac > 0.20
-                )
-                if (not finishing) and (hp_frac < HEAL_ENTER_FRAC) and (nearest_d < 120.0 or recent_hit):
-                    self.heal = True
-                    self.heal_since = t
-            if self.heal:
-                for e in enemies[:4]:
-                    if self.enemy_sees_me(e, pos):
-                        exposed = True
-                        break
-
-        engage_mech = target_type == "mech"
-        if engage_mech and NO_CHASE and t_dist > CHASE_MAX:
-            engage_mech = False
-        if engage_mech and t < EARLY_PASSIVE_S and t_dist > 70.0:
-            engage_mech = False
-
-        # 5. Movement (Max Aggression)
+        # 5. Movement: Perimeter Loop + Encounter-Only Kills (Never Dive Center!)
         move_x, move_y = 0.0, 0.0
         want_boost = False
-        pre_checked = False
-        hold_still = False
+        loop_wp = self.compute_loop_waypoint(pos, zc, zr)
 
         d_zone = dist2d(pos, zc)
-        outside_next = d_zone > max(zr - 18.0, 5.0)
         urgent_zone = (not me["in_zone"]) or (d_zone > zr - 8.0 and t > zone["shrink_start"] - 12.0)
 
-        # Always scoop nearby cubes (free heal + stats even if healing)
+        # Decide whether to commit to chasing a mech or keep looping the perimeter while shooting it
+        commit_mech = False
+        if target_type == "mech":
+            t_dist = dist2d(pos, target["pos"])
+            t_from_center = dist2d(target["pos"], zc)
+            in_center_trap = (t_from_center < zr * CENTER_AVOID_FRAC) and (t_dist > 52.0)
+            # Commit if they are close (<85m) and NOT dragging us into the center meat-grinder
+            if t_dist < 85.0 and not in_center_trap:
+                commit_mech = True
+
+        # If a pack of 2+ enemies is ahead on our loop, flip loop direction to go around them
+        if len(near_enemies) >= 2:
+            pack_x = sum(e["pos"][0] for e in near_enemies) / len(near_enemies)
+            pack_y = sum(e["pos"][1] for e in near_enemies) / len(near_enemies)
+            if dist2d(loop_wp, (pack_x, pack_y)) < dist2d(pos, (pack_x, pack_y)) - 8.0:
+                self.loop_dir = -self.loop_dir
+                loop_wp = self.compute_loop_waypoint(pos, zc, zr)
+
         close_cube = None
-        if cubes and not evading:
+        if cubes:
             c = min(cubes, key=lambda x: dist2d(pos, x["pos"]))
-            cd = dist2d(pos, c["pos"])
-            if self.heal:
-                if cd < 22.0:
-                    close_cube = c
-            elif cd < (30.0 if near_enemies else 115.0):
+            if dist2d(pos, c["pos"]) < (28.0 if near_enemies else 100.0):
                 close_cube = c
 
         best_drop = None
-        if not evading:
-            for dr in drops:
-                dd = dist2d(pos, dr["pos"])
-                if dr["lands_in"] < 20.0 and dd < (180.0 if (hp_frac < 0.72 or my_cubes < 10) else 100.0):
-                    if len(near_enemies) <= 1 or dd < 24.0:
-                        best_drop = dr
-                        break
+        for dr in drops:
+            dd = dist2d(pos, dr["pos"])
+            # Only grab drops that aren't deep in the center with multiple enemies
+            if dr["lands_in"] < 20.0 and dd < (160.0 if (hp_frac < 0.72 or my_cubes < 10) else 90.0):
+                if len(near_enemies) <= 1 or dd < 24.0:
+                    best_drop = dr
+                    break
 
         if urgent_zone:
             move_x, move_y = zc[0] - pos[0], zc[1] - pos[1]
-            want_boost = energy > 20.0
+            want_boost = energy > 22.0
         elif close_cube is not None:
             move_x, move_y = close_cube["pos"][0] - pos[0], close_cube["pos"][1] - pos[1]
-            want_boost = energy > 28.0 and dist2d(pos, close_cube["pos"]) > 10.0
-        elif self.heal:
-            if exposed or recent_hit or nearest_d < 45.0:
-                if threats or enemies:
-                    th = threats if threats else enemies
-                    d_ev = self.map.evade_direction(pos, muzzle_h, th, zc, zr, self.prev_evade_dir)
-                    if d_ev is None:
-                        cx = sum(e["pos"][0] for e in th) / len(th)
-                        cy = sum(e["pos"][1] for e in th) / len(th)
-                        move_x, move_y = pos[0] - cx, pos[1] - cy
-                    else:
-                        move_x, move_y = d_ev
-                        self.prev_evade_dir = d_ev
-                        pre_checked = True
-                elif self.last_damage_bearing is not None:
-                    move_x = -math.cos(self.last_damage_bearing)
-                    move_y = -math.sin(self.last_damage_bearing)
-                want_boost = energy > 20.0 and (recent_hit or exposed)
-            elif best_drop is not None:
-                dd = dist2d(pos, best_drop["pos"])
-                if DROP_HOLD and dd < 3.0:
-                    hold_still = True
-                else:
-                    move_x, move_y = best_drop["pos"][0] - pos[0], best_drop["pos"][1] - pos[1]
-                    want_boost = energy > 30.0 and dd > best_drop["radius"]
-            else:
-                hold_still = True
-        elif evading:
-            d_ev = self.map.evade_direction(pos, muzzle_h, threats, zc, zr, self.prev_evade_dir)
-            if d_ev is None:
-                cx = sum(e["pos"][0] for e in threats) / len(threats)
-                cy = sum(e["pos"][1] for e in threats) / len(threats)
-                move_x, move_y = pos[0] - cx, pos[1] - cy
-            else:
-                move_x, move_y = d_ev
-                self.prev_evade_dir = d_ev
-                pre_checked = True
-            want_boost = energy > 20.0 and (took_hit or n_close >= 3)
-        elif best_drop is not None and (not near_enemies or hp_frac < 0.55):
+            want_boost = energy > 35.0 and dist2d(pos, close_cube["pos"]) > 12.0
+        elif best_drop is not None and (not near_enemies or hp_frac < 0.60):
             dd = dist2d(pos, best_drop["pos"])
             if DROP_HOLD and dd < 3.0:
                 pass
             else:
                 move_x, move_y = best_drop["pos"][0] - pos[0], best_drop["pos"][1] - pos[1]
-                want_boost = energy > 30.0 and dd > best_drop["radius"]
-        elif engage_mech:
+                want_boost = energy > 35.0 and dd > best_drop["radius"]
+        elif commit_mech:
             ex, ey = target["pos"][0], target["pos"][1]
             dx, dy = ex - pos[0], ey - pos[1]
             d = max(math.hypot(dx, dy), 1e-4)
             nx, ny = dx / d, dy / d
 
             if len(near_enemies) >= 2:
-                # AGGRESSIVE 1v2+ ANGLE-SPLIT: strafe around primary AWAY from secondaries,
-                # while staying inside Lightning chain range when healthy!
+                # 1v2+ ANGLE-SPLIT biased along our perimeter loop!
                 others = [e for e in near_enemies if e is not target]
                 ox = sum(e["pos"][0] for e in others) / len(others)
                 oy = sum(e["pos"][1] for e in others) / len(others)
@@ -623,45 +493,35 @@ class Bot:
 
                 s1x, s1y = -ny, nx
                 s2x, s2y = ny, -nx
-                if (s1x * ax + s1y * ay) >= (s2x * ax + s2y * ay):
-                    sx, sy = s1x, s1y
-                else:
-                    sx, sy = s2x, s2y
+                sx, sy = (s1x, s1y) if (s1x * ax + s1y * ay) >= (s2x * ax + s2y * ay) else (s2x, s2y)
 
-                zx, zy = zc[0] - pos[0], zc[1] - pos[1]
-                zm = max(math.hypot(zx, zy), 1e-4)
-                pull = 0.28 if (has_lightning and hp_frac > 0.35 and d > 36.0) else 0.0
-                move_x = sx * 0.62 + ax * 0.48 + nx * pull + (zx / zm) * 0.14
-                move_y = sy * 0.62 + ay * 0.48 + ny * pull + (zy / zm) * 0.14
-                want_boost = energy > 24.0 and (dist2d(pos, others[0]["pos"]) < 45.0 or (pull > 0.0 and d < 55.0))
+                lx, ly = loop_wp[0] - pos[0], loop_wp[1] - pos[1]
+                lm = max(math.hypot(lx, ly), 1e-4)
+                move_x = sx * 0.55 + ax * 0.45 + (lx / lm) * 0.25
+                move_y = sy * 0.55 + ay * 0.45 + (ly / lm) * 0.25
+                want_boost = energy > 28.0 and dist2d(pos, others[0]["pos"]) < 45.0
             else:
-                # MAX-AGGRESSION 1v1 BACKSTAB SHRED
+                # 1v1 ENCOUNTER KILL: Full-speed blind-spot backstab orbit
                 e_yaw = target.get("aim", [0.0, 0.0])[0]
                 rel = angle_diff(math.atan2(pos[1] - ey, pos[0] - ex), e_yaw)
                 flank_dir = -1.0 if rel >= 0.0 else 1.0
                 sx, sy = -ny * flank_dir, nx * flank_dir
 
-                if GATED_RUSH:
-                    t_hp_frac = target.get("hp", 1000.0) / max(target.get("max_hp", 1400.0), 1.0)
-                    rush = has_lightning and hp_frac > 0.6 and t_hp_frac < 0.6
-                else:
-                    rush = has_lightning and hp_frac > 0.20
-                ideal_dist = 24.0 if rush else 54.0
-
-                if hp_frac < 0.18:
-                    move_x = -nx * 0.68 + sx * 0.73
-                    move_y = -ny * 0.68 + sy * 0.73
-                    want_boost = energy > 20.0
-                elif d > ideal_dist + 7.0:
-                    move_x = nx * 0.64 + sx * 0.77
-                    move_y = ny * 0.64 + sy * 0.77
-                    want_boost = has_lightning and d < 75.0 and energy > 25.0
-                elif d < ideal_dist - 7.0:
-                    move_x = -nx * 0.48 + sx * 0.88
-                    move_y = -ny * 0.48 + sy * 0.88
+                ideal_dist = 26.0 if (has_lightning and hp_frac > 0.26) else 56.0
+                if hp_frac < 0.24:
+                    move_x = -nx * 0.72 + sx * 0.70
+                    move_y = -ny * 0.72 + sy * 0.70
+                    want_boost = energy > 24.0
+                elif d > ideal_dist + 8.0:
+                    move_x = nx * 0.58 + sx * 0.81
+                    move_y = ny * 0.58 + sy * 0.81
+                    want_boost = has_lightning and d < 66.0 and energy > 32.0
+                elif d < ideal_dist - 8.0:
+                    move_x = -nx * 0.50 + sx * 0.86
+                    move_y = -ny * 0.50 + sy * 0.86
                 else:
                     move_x, move_y = sx, sy
-                    if has_lightning and d < 38.0 and 0.55 < abs(rel) < 2.0 and energy > 22.0:
+                    if has_lightning and d < 36.0 and 0.60 < abs(rel) < 1.95 and energy > 30.0:
                         want_boost = True
 
             if target.get("charging"):
@@ -679,55 +539,42 @@ class Bot:
             if valid_p:
                 p = min(valid_p, key=lambda x: dist2d(pos, x["pos"]))
                 move_x, move_y = p["pos"][0] - pos[0], p["pos"][1] - pos[1]
-                want_boost = energy > 30.0
-        elif target_type in ("npc", "crate"):
+                want_boost = energy > 40.0
+        elif target_type in ("npc", "crate") and dist2d(pos, target["pos"]) < 55.0:
             dx, dy = target["pos"][0] - pos[0], target["pos"][1] - pos[1]
-            if math.hypot(dx, dy) > 24.0:
+            if math.hypot(dx, dy) > 25.0:
                 move_x, move_y = dx, dy
             else:
                 move_x, move_y = -dy * self.strafe_dir, dx * self.strafe_dir
-        elif outside_next:
-            move_x, move_y = zc[0] - pos[0], zc[1] - pos[1]
         else:
-            if self.roam_target is None or dist2d(pos, self.roam_target) < 15.0:
-                ang = self.rng.uniform(0.0, TWO_PI)
-                rad = self.rng.uniform(0.15, 0.72) * max(zr - 15.0, 10.0)
-                self.roam_target = (
-                    clamp(zc[0] + math.cos(ang) * rad, self.map.bounds[0], self.map.bounds[1]),
-                    clamp(zc[1] + math.sin(ang) * rad, self.map.bounds[2], self.map.bounds[3]),
-                )
-            move_x, move_y = self.roam_target[0] - pos[0], self.roam_target[1] - pos[1]
+            # PERIMETER LOOP: Sweep around the outer edge of the next safe zone!
+            move_x = loop_wp[0] - pos[0]
+            move_y = loop_wp[1] - pos[1]
+            want_boost = energy > 60.0 and not near_enemies
 
         # Laser dodge overrides movement
         if LASER_DODGE:
             ld = self.laser_dodge(pos, enemies)
             if ld is not None:
                 move_x, move_y = ld
-                pre_checked = False
-                hold_still = False
                 if energy > 20.0:
                     want_boost = True
 
-        if pre_checked:
-            mx, my = move_x, move_y
-        else:
-            mx, my = self.map.steer_around_walls(pos, move_x, move_y)
+        mx, my = self.map.steer_around_walls(pos, move_x, move_y)
         action["move"] = [mx, my]
         action["boost"] = want_boost
-        if self.stuck_ticks >= 4 and not hold_still:
+
+        if self.stuck_ticks >= 4:
             if me["grounded"]:
                 action["jump"] = True
             elif energy > 25.0:
                 action["boost"] = True
             if self.stuck_ticks >= 10:
                 self.strafe_dir = -self.strafe_dir
-                self.roam_target = None
-                self.prev_evade_dir = None
+                self.loop_dir = -self.loop_dir
                 self.stuck_ticks = 0
 
-        # 6. Aiming & Firing (100% Aggressive DPS)
-        suppress_fire = self.heal and nearest_d >= 35.0
-
+        # 6. Aiming & Firing (Always shoot any visible target while looping!)
         if target is not None:
             tpos = target["pos"]
             tvel = target.get("vel", [0.0, 0.0, 0.0])
@@ -745,55 +592,44 @@ class Bot:
             yaw_err = abs(angle_diff(des_yaw, cur_yaw))
 
             fire_flags = [False, False]
-            if not suppress_fire:
-                for s_idx, w in enumerate(weapons):
-                    if w is None:
-                        continue
-                    kind = w["kind"]
-                    wstats = w.get("stats", {})
+            for s_idx, w in enumerate(weapons):
+                if w is None:
+                    continue
+                kind = w["kind"]
+                wstats = w.get("stats", {})
 
-                    if kind == "lightning":
-                        min_energy = 5.0
-                        if LIGHTNING_RESERVE:
-                            finishing_k = target_type == "mech" and target.get("hp", 1000.0) < 150.0
-                            min_energy = 5.0 if finishing_k else 22.0
-                        if target_los and d_target <= wstats.get("range", 45.0) - 1.0 and yaw_err < 0.48 and energy > min_energy:
+                if kind == "lightning":
+                    if target_los and d_target <= wstats.get("range", 45.0) - 1.0 and yaw_err < 0.48 and energy > 5.0:
+                        fire_flags[s_idx] = True
+
+                elif kind == "gun":
+                    if target_los and d_target <= wstats.get("range", 230.0) and yaw_err < 0.15 and w.get("reload", 0.0) <= 0.0:
+                        fire_flags[s_idx] = True
+
+                elif kind == "laser":
+                    charge = w.get("charge", 0.0)
+                    full_charge = wstats.get("charge", 0.75)
+                    min_charge = wstats.get("min_charge", 0.15)
+                    if target_type == "mech" and target_los and d_target <= wstats.get("range", 280.0):
+                        des_yaw, des_pitch = self.aim_at_point(muzzle_pos, aim_center)
+                        yaw_err = abs(angle_diff(des_yaw, cur_yaw))
+                        if charge == 0.0:
+                            if w.get("cooldown", 0.0) <= 0.0 and yaw_err < 0.45:
+                                fire_flags[s_idx] = True
+                        elif (charge >= full_charge * 0.72 and yaw_err < 0.08) or (
+                            charge >= min_charge and target.get("hp", 1000) < 160 and yaw_err < 0.09
+                        ):
+                            fire_flags[s_idx] = False
+                        else:
                             fire_flags[s_idx] = True
 
-                    elif kind == "gun":
-                        if target_los and d_target <= wstats.get("range", 230.0) and yaw_err < 0.15 and w.get("reload", 0.0) <= 0.0:
+                elif kind == "mortar":
+                    if d_target <= 215.0 and d_target >= 18.0 and w.get("cooldown", 0.0) <= 0.0:
+                        des_pitch = self.mortar_pitch(muzzle_pos, aim_center, wstats.get("speed", 72.0), wstats.get("gravity", 22.0))
+                        if yaw_err < 0.14:
                             fire_flags[s_idx] = True
 
-                    elif kind == "laser":
-                        charge = w.get("charge", 0.0)
-                        full_charge = wstats.get("charge", 0.75)
-                        min_charge = wstats.get("min_charge", 0.15)
-                        if target_type == "mech" and target_los and d_target <= wstats.get("range", 280.0):
-                            des_yaw, des_pitch = self.aim_at_point(muzzle_pos, aim_center)
-                            yaw_err = abs(angle_diff(des_yaw, cur_yaw))
-                            if charge == 0.0:
-                                if w.get("cooldown", 0.0) <= 0.0 and yaw_err < 0.45:
-                                    fire_flags[s_idx] = True
-                            elif (charge >= full_charge * 0.72 and yaw_err < 0.08) or (
-                                charge >= min_charge and target.get("hp", 1000) < 160 and yaw_err < 0.09
-                            ):
-                                fire_flags[s_idx] = False
-                            else:
-                                fire_flags[s_idx] = True
-
-                    elif kind == "mortar":
-                        if d_target <= 215.0 and d_target >= 18.0 and w.get("cooldown", 0.0) <= 0.0:
-                            des_pitch = self.mortar_pitch(muzzle_pos, aim_center, wstats.get("speed", 72.0), wstats.get("gravity", 22.0))
-                            if yaw_err < 0.14:
-                                fire_flags[s_idx] = True
-
-            if suppress_fire or hold_still:
-                fire_flags = [False, False]
-                for w in weapons:
-                    if w and w["kind"] == "gun" and w.get("reload", 0.0) <= 0.0:
-                        if w.get("ammo", 12) < w["stats"].get("mag", 12):
-                            action["reload"] = True
-            elif not target_los:
+            if not target_los:
                 for w in weapons:
                     if w and w["kind"] == "gun" and w.get("reload", 0.0) <= 0.0:
                         if w.get("ammo", 12) < w["stats"].get("mag", 12) * 0.55:
@@ -804,8 +640,6 @@ class Bot:
         else:
             if self.last_damage_bearing is not None and (t - self.last_damage_t) < 2.5:
                 action["aim"] = [self.last_damage_bearing, 0.0]
-            elif hold_still:
-                action["aim"] = [cur_yaw, 0.0]
             elif obs.get("sounds"):
                 near_sounds = [s for s in obs["sounds"] if s["dist"] in ("near", "mid")]
                 if near_sounds:
@@ -816,38 +650,26 @@ class Bot:
             for w in weapons:
                 if w and w["kind"] == "gun" and w.get("reload", 0.0) <= 0.0:
                     mag = w["stats"].get("mag", 12)
-                    thresh = 1.0 if (suppress_fire or hold_still) else 0.65
-                    if w.get("ammo", mag) < mag * thresh:
+                    if w.get("ammo", mag) < mag * 0.65:
                         action["reload"] = True
 
         # 6b. Debug overlay
         if DEBUG_DRAW:
             try:
-                state = "HEAL" if self.heal else ("EVADE" if (EVADE_ENABLED and self.mode == "evade") else "FIGHT")
-                mf.draw.label(
-                    f"{state}{' HOLD' if hold_still else ''} hp{int(hp_frac * 100)} "
-                    f"c{n_close} s{n_seen} e{int(energy)} a{obs.get('alive')}"
-                )
-                for e in enemies[:4]:
-                    ep = e["pos"]
-                    sees = self.enemy_sees_me(e, pos)
-                    mf.draw.line(
-                        [pos[0], pos[1], pos[2] + 7.0],
-                        [ep[0], ep[1], ep[2] + 4.5],
-                        "#ff4040" if sees else "#808080",
-                    )
-                mf.draw.point([zc[0], zc[1], pos[2]], "#40c0ff", 6)
+                state = "COMMIT" if commit_mech else "LOOP"
+                mf.draw.label(f"{state} hp{int(hp_frac * 100)} c{len(near_enemies)} e{int(energy)} a{obs.get('alive')}")
+                mf.draw.point([loop_wp[0], loop_wp[1], pos[2] + 2.0], "#40ff60", 6)
+                mf.draw.point([zc[0], zc[1], pos[2]], "#40c0ff", 5)
             except Exception:
                 pass
 
         # 7. Logging
-        if LOGGING and (took_hit or n_close > 0 or self.heal) and t - self._last_log > 1.0:
+        if LOGGING and (took_hit or near_enemies) and t - self._last_log > 1.0:
             self._last_log = t
             try:
                 mf.log(
-                    f"t={t:.0f} alive={obs.get('alive')} hp={hp_frac:.2f} mode={self.mode} heal={int(self.heal)} "
-                    f"hold={int(hold_still)} exp={int(exposed)} close={n_close} seen={n_seen} en={energy:.0f} "
-                    f"inzone={int(me['in_zone'])} dz={d_zone:.0f}/{zr:.0f} cubes={my_cubes}"
+                    f"t={t:.0f} alive={obs.get('alive')} hp={hp_frac:.2f} commit={int(commit_mech)} "
+                    f"near={len(near_enemies)} en={energy:.0f} dz={d_zone:.0f}/{zr:.0f} cubes={my_cubes}"
                 )
             except Exception:
                 pass
