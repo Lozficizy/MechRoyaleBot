@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-ApexMech v7.0 - Locked-In Brawler (Built directly on V1.5's 3.75 base)
-Fixes: Gun+Lightning lock, tight aim tolerance, anti-lead juke strafing,
-energy discipline, and kill-chain cube snowball. (<2ms/tick)
+ApexMech v8.0 - Cube Snowball + High-DPS Kite (mechfight/1)
+- Early NPC/crate farming to hit 10-cube (+40% HP/DMG) power spike fast
+- Aggressive supply-drop rotations for full HP + energy + 3 cubes
+- High-DPS Gun + Lightning dual-wield with restored aim window
+- Fast <2ms/tick spatial-grid wall steering & LOS
 """
 import json
 import math
@@ -49,8 +51,6 @@ def point_in_ring(x: float, y: float, ring) -> bool:
 
 
 class ArenaMap:
-    """Fast spatial-grid lookup for prisms (buildings/stadium/bridges)."""
-
     def __init__(self, map_dir: str):
         self.cell_size = 45.0
         self.grid: dict[tuple[int, int], list[int]] = {}
@@ -87,12 +87,8 @@ class ArenaMap:
                     }
                     idx = len(self.prisms)
                     self.prisms.append(prism)
-                    cx0 = int(math.floor(minx / self.cell_size))
-                    cx1 = int(math.floor(maxx / self.cell_size))
-                    cy0 = int(math.floor(miny / self.cell_size))
-                    cy1 = int(math.floor(maxy / self.cell_size))
-                    for cx in range(cx0, cx1 + 1):
-                        for cy in range(cy0, cy1 + 1):
+                    for cx in range(int(math.floor(minx / self.cell_size)), int(math.floor(maxx / self.cell_size)) + 1):
+                        for cy in range(int(math.floor(miny / self.cell_size)), int(math.floor(maxy / self.cell_size)) + 1):
                             self.grid.setdefault((cx, cy), []).append(idx)
             except Exception as e:
                 mf.log(f"[map] load error: {e}")
@@ -109,12 +105,7 @@ class ArenaMap:
             if x < minx or x > maxx or y < miny or y > maxy:
                 continue
             if point_in_ring(x, y, p["ring"]):
-                in_hole = False
-                for h in p["holes"]:
-                    if point_in_ring(x, y, h):
-                        in_hole = True
-                        break
-                if not in_hole:
+                if not any(point_in_ring(x, y, h) for h in p["holes"]):
                     return True
         return False
 
@@ -133,12 +124,7 @@ class ArenaMap:
             if x < minx or x > maxx or y < miny or y > maxy:
                 continue
             if point_in_ring(x, y, p["ring"]):
-                in_hole = False
-                for h in p["holes"]:
-                    if point_in_ring(x, y, h):
-                        in_hole = True
-                        break
-                if not in_hole:
+                if not any(point_in_ring(x, y, h) for h in p["holes"]):
                     return True
         return False
 
@@ -146,7 +132,7 @@ class ArenaMap:
         d = dist3d(a, b)
         if d < 5.0:
             return True
-        steps = min(int(d / 6.0), 22)
+        steps = min(int(d / 7.0), 20)
         if steps < 2:
             return True
         dx = (b[0] - a[0]) / steps
@@ -179,7 +165,7 @@ class ArenaMap:
 
 
 class Bot:
-    name = "ApexMech-v7.0"
+    name = "ApexMech-v8.0"
 
     def __init__(self, hello: mf.Hello):
         self.slot = hello["slot"]
@@ -188,19 +174,18 @@ class Bot:
         self.map = ArenaMap(hello["map"]["dir"])
         self.pickup_r = self.config.get("loot", {}).get("pickup_radius", 4.0)
 
-        # LOCK IN Gun + Lightning (never drop Gun for Laser/Mortar!)
+        # Lock in Gun + Lightning (never drop Gun for Laser/Mortar)
         self.weapon_rank = {"lightning": 5, "gun": 4, "laser": 3, "mortar": 1}
 
-        # Combat DPS + Armor + HP upgrades
         self.upgrade_weights = {
             "armor": 100,
             "hp": 97,
             "lightning": 95,
             "gun_rate": 93,
             "gun_damage": 92,
-            "regen": 88,
+            "regen": 89,
+            "reload": 86,
             "speed": 85,
-            "reload": 84,
             "laser": 82,
             "energy": 80,
             "boost": 76,
@@ -212,14 +197,13 @@ class Bot:
         self.stuck_ticks = 0
         self.strafe_dir = 1.0
         self.strafe_timer = 0
-        self.strafe_period = 7
+        self.strafe_period = 8
         self.last_damage_bearing = None
         self.last_damage_t = -10.0
         self.roam_target = None
 
     def pick_upgrade(self, offer) -> int:
-        best_i = 0
-        best_score = -1e9
+        best_i, best_score = 0, -1e9
         for i, ch in enumerate(offer.get("choices", [])):
             uid = ch.get("id", "").lower()
             desc = ch.get("desc", "").lower()
@@ -228,8 +212,7 @@ class Bot:
                 if k in uid or k in desc:
                     score = max(score, w)
             if score > best_score:
-                best_score = score
-                best_i = i
+                best_score, best_i = score, i
         return best_i
 
     def aim_at_point(self, muzzle_pos, target_pos):
@@ -269,9 +252,10 @@ class Bot:
         hp_frac = me["hp"] / max(me["max_hp"], 1.0)
         energy = me["energy"]
         weapons = me["weapons"]
+        my_cubes = me.get("cubes", 0)
         stats = me.get("stats", {})
         muzzle_pos = (pos[0], pos[1], pos[2] + stats.get("muzzle_height", 7.0))
-        cur_yaw, cur_pitch = me["aim"]
+        cur_yaw, _ = me["aim"]
 
         for ev in obs.get("events", []):
             if ev.get("type") == "damaged" and ev.get("bearing") is not None:
@@ -284,12 +268,11 @@ class Bot:
             self.stuck_ticks = 0
         self.last_pos = pos
 
-        # Anti-lead juke strafing (flip every 0.6s - 0.9s)
         self.strafe_timer += 1
         if self.strafe_timer >= self.strafe_period:
             self.strafe_timer = 0
             self.strafe_dir = -self.strafe_dir
-            self.strafe_period = self.rng.randint(6, 9)
+            self.strafe_period = self.rng.randint(7, 11)
 
         action: mf.Action = {
             "tick": obs["tick"],
@@ -305,7 +288,7 @@ class Bot:
         if obs.get("offer") is not None:
             action["pick"] = self.pick_upgrade(obs["offer"])
 
-        # 2. Weapon pickup / swap (locks in Gun + Lightning)
+        # 2. Weapon pickup / swap
         held_kinds = {w["kind"] for w in weapons if w is not None}
         empty_slot = 0 if weapons[0] is None else (1 if weapons[1] is None else None)
         for p in obs.get("pickups", []):
@@ -340,40 +323,38 @@ class Bot:
         zc = zone["next_center"]
         zr = zone["next_radius"]
 
-        # 4. Target Selection (lowest-HP enemy in LOS first to chain kills & cubes!)
+        # 4. Target Selection
+        enemies.sort(key=lambda e: dist2d(pos, e["pos"]))
+        near_enemies = [e for e in enemies if dist2d(pos, e["pos"]) < 85.0]
         target = None
         target_type = None
         target_los = False
 
         if enemies:
-            enemies.sort(key=lambda e: dist2d(pos, e["pos"]))
-            scored_enemies = []
+            scored = []
             for e in enemies[:4]:
                 ep = e["pos"]
                 d = dist2d(pos, ep)
                 los = self.map.has_los(muzzle_pos, (ep[0], ep[1], ep[2] + 4.5))
-                hp_w = 0.45 + 0.55 * (e.get("hp", 1000) / max(e.get("max_hp", 1400), 1.0))
-                score = d * hp_w + (0.0 if los else 130.0)
-                scored_enemies.append((score, los, e))
-            scored_enemies.sort(key=lambda x: x[0])
-            _, target_los, target = scored_enemies[0]
+                hp_w = 0.50 + 0.50 * (e.get("hp", 1000) / max(e.get("max_hp", 1400), 1.0))
+                scored.append((d * hp_w + (0.0 if los else 130.0), los, e))
+            scored.sort(key=lambda x: x[0])
+            _, target_los, target = scored[0]
             target_type = "mech"
-        elif npcs:
-            nearest_npc = min(npcs, key=lambda n: dist2d(pos, n["pos"]))
-            if dist2d(pos, nearest_npc["pos"]) < 85.0:
-                target = nearest_npc
-                target_type = "npc"
-                target_los = self.map.has_los(
-                    muzzle_pos, (target["pos"][0], target["pos"][1], target["pos"][2] + 1.8)
-                )
-        if target is None and crates:
-            nearest_crate = min(crates, key=lambda c: dist2d(pos, c["pos"]))
-            if dist2d(pos, nearest_crate["pos"]) < 65.0:
-                target = nearest_crate
-                target_type = "crate"
-                target_los = self.map.has_los(
-                    muzzle_pos, (target["pos"][0], target["pos"][1], target["pos"][2] + 1.2)
-                )
+
+        # If no enemy is close (<65m) and we need cubes (<10), farm NPCs/crates!
+        if (target is None or (my_cubes < 10 and dist2d(pos, target["pos"]) > 65.0)) and npcs:
+            n = min(npcs, key=lambda x: dist2d(pos, x["pos"]))
+            if dist2d(pos, n["pos"]) < 95.0:
+                n_los = self.map.has_los(muzzle_pos, (n["pos"][0], n["pos"][1], n["pos"][2] + 1.8))
+                if n_los or target is None:
+                    target, target_type, target_los = n, "npc", n_los
+        if (target is None or (my_cubes < 8 and target_type == "mech" and dist2d(pos, target["pos"]) > 75.0)) and crates:
+            c = min(crates, key=lambda x: dist2d(pos, x["pos"]))
+            if dist2d(pos, c["pos"]) < 70.0:
+                c_los = self.map.has_los(muzzle_pos, (c["pos"][0], c["pos"][1], c["pos"][2] + 1.2))
+                if c_los or target is None:
+                    target, target_type, target_los = c, "crate", c_los
 
         # 5. Movement Decision
         move_x, move_y = 0.0, 0.0
@@ -384,87 +365,88 @@ class Bot:
         outside_next = d_zone > max(zr - 18.0, 5.0)
         urgent_zone = (not me["in_zone"]) or (d_zone > zr - 8.0 and t > zone["shrink_start"] - 12.0)
 
-        # Grab very close cubes immediately for instant heal + dmg buff
+        # Grab close cubes immediately for instant heal + dmg buff
         close_cube = None
         if cubes:
             c = min(cubes, key=lambda x: dist2d(pos, x["pos"]))
-            if dist2d(pos, c["pos"]) < (22.0 if enemies else 90.0):
+            if dist2d(pos, c["pos"]) < (28.0 if near_enemies else 110.0):
                 close_cube = c
 
+        # Aggressive supply-drop full-heal rotation
         best_drop = None
         for dr in drops:
-            if dr["lands_in"] < 12.0 and dist2d(pos, dr["pos"]) < 95.0:
-                if not enemies or dist2d(pos, dr["pos"]) < 25.0:
+            dd = dist2d(pos, dr["pos"])
+            if dr["lands_in"] < 20.0 and dd < (180.0 if (hp_frac < 0.72 or my_cubes < 10) else 100.0):
+                if len(near_enemies) <= 1 or dd < 24.0:
                     best_drop = dr
                     break
 
         if urgent_zone:
-            move_x = zc[0] - pos[0]
-            move_y = zc[1] - pos[1]
-            want_boost = energy > 25.0
+            move_x, move_y = zc[0] - pos[0], zc[1] - pos[1]
+            want_boost = energy > 22.0
         elif close_cube is not None:
-            move_x = close_cube["pos"][0] - pos[0]
-            move_y = close_cube["pos"][1] - pos[1]
-            want_boost = energy > 45.0 and dist2d(pos, close_cube["pos"]) > 12.0
+            move_x, move_y = close_cube["pos"][0] - pos[0], close_cube["pos"][1] - pos[1]
+            want_boost = energy > 40.0 and dist2d(pos, close_cube["pos"]) > 12.0
+        elif best_drop is not None and (not near_enemies or hp_frac < 0.60):
+            move_x, move_y = best_drop["pos"][0] - pos[0], best_drop["pos"][1] - pos[1]
+            want_boost = energy > 35.0 and dist2d(pos, best_drop["pos"]) > best_drop["radius"]
         elif target_type == "mech":
-            ex, ey = target["pos"][0], target["pos"][1]
-            dx, dy = ex - pos[0], ey - pos[1]
-            d = max(math.hypot(dx, dy), 1e-4)
-            nx, ny = dx / d, dy / d
-            sx, sy = -ny * self.strafe_dir, nx * self.strafe_dir
-
-            # Keep Lightning right in its 34-40m sweet spot; Gun at 62m
-            ideal_dist = 35.0 if (has_lightning and hp_frac > 0.35) else 62.0
-
-            if hp_frac < 0.32:
-                move_x = -nx * 0.8 + sx * 0.6
-                move_y = -ny * 0.8 + sy * 0.6
-                want_boost = energy > 28.0
-            elif d > ideal_dist + 8.0:
-                move_x = nx * 0.65 + sx * 0.75
-                move_y = ny * 0.65 + sy * 0.75
-                want_boost = has_lightning and d < 60.0 and energy > 50.0
-            elif d < ideal_dist - 8.0:
-                move_x = -nx * 0.65 + sx * 0.75
-                move_y = -ny * 0.65 + sy * 0.75
+            if len(near_enemies) >= 2:
+                # Multi-bot kite: backpedal away from pack centroid toward zone center
+                cx = sum(e["pos"][0] for e in near_enemies) / len(near_enemies)
+                cy = sum(e["pos"][1] for e in near_enemies) / len(near_enemies)
+                dx, dy = pos[0] - cx, pos[1] - cy
+                d = max(math.hypot(dx, dy), 1e-4)
+                nx, ny = dx / d, dy / d
+                sx, sy = -ny * self.strafe_dir, nx * self.strafe_dir
+                zx, zy = zc[0] - pos[0], zc[1] - pos[1]
+                zm = max(math.hypot(zx, zy), 1e-4)
+                move_x = nx * 0.72 + sx * 0.58 + (zx / zm) * 0.25
+                move_y = ny * 0.72 + sy * 0.58 + (zy / zm) * 0.25
+                want_boost = energy > 30.0 and dist2d(pos, near_enemies[0]["pos"]) < 38.0
             else:
-                move_x, move_y = sx, sy
+                ex, ey = target["pos"][0], target["pos"][1]
+                dx, dy = ex - pos[0], ey - pos[1]
+                d = max(math.hypot(dx, dy), 1e-4)
+                nx, ny = dx / d, dy / d
+                sx, sy = -ny * self.strafe_dir, nx * self.strafe_dir
+
+                ideal_dist = 35.0 if (has_lightning and hp_frac > 0.36) else 64.0
+                if hp_frac < 0.34:
+                    move_x = -nx * 0.80 + sx * 0.60
+                    move_y = -ny * 0.80 + sy * 0.60
+                    want_boost = energy > 25.0
+                elif d > ideal_dist + 9.0:
+                    move_x = nx * 0.65 + sx * 0.75
+                    move_y = ny * 0.65 + sy * 0.75
+                    want_boost = has_lightning and d < 62.0 and energy > 48.0
+                elif d < ideal_dist - 9.0:
+                    move_x = -nx * 0.65 + sx * 0.75
+                    move_y = -ny * 0.65 + sy * 0.75
+                else:
+                    move_x, move_y = sx, sy
 
             if target.get("charging"):
-                move_x, move_y = sx, sy
+                ex, ey = target["pos"][0], target["pos"][1]
+                dx, dy = ex - pos[0], ey - pos[1]
+                d = max(math.hypot(dx, dy), 1e-4)
+                move_x, move_y = (-dy / d) * self.strafe_dir, (dx / d) * self.strafe_dir
                 want_boost = energy > 18.0
-            for proj in obs.get("projectiles", []):
-                if dist2d(pos, proj["pos"]) < 26.0:
-                    pvx, pvy = proj["vel"][0], proj["vel"][1]
-                    pm = math.hypot(pvx, pvy)
-                    if pm > 1.0:
-                        move_x += (-pvy / pm) * self.strafe_dir * 0.9
-                        move_y += (pvx / pm) * self.strafe_dir * 0.9
-                        want_boost = energy > 30.0
-                        break
         elif (empty_slot is not None or not has_lightning) and pickups:
-            # Actively hunt Lightning if we don't have it yet
             lp = [p for p in pickups if p["kind"] == "lightning"]
             valid_p = lp if (lp and not has_lightning) else [p for p in pickups if p["kind"] not in held_kinds]
             if valid_p:
                 p = min(valid_p, key=lambda x: dist2d(pos, x["pos"]))
-                move_x = p["pos"][0] - pos[0]
-                move_y = p["pos"][1] - pos[1]
-                want_boost = energy > 55.0
-        elif best_drop is not None:
-            move_x = best_drop["pos"][0] - pos[0]
-            move_y = best_drop["pos"][1] - pos[1]
-            want_boost = energy > 50.0 and dist2d(pos, best_drop["pos"]) > best_drop["radius"]
+                move_x, move_y = p["pos"][0] - pos[0], p["pos"][1] - pos[1]
+                want_boost = energy > 50.0
         elif target_type in ("npc", "crate"):
-            dx = target["pos"][0] - pos[0]
-            dy = target["pos"][1] - pos[1]
-            if math.hypot(dx, dy) > 28.0:
+            dx, dy = target["pos"][0] - pos[0], target["pos"][1] - pos[1]
+            if math.hypot(dx, dy) > 26.0:
                 move_x, move_y = dx, dy
             else:
                 move_x, move_y = -dy * self.strafe_dir, dx * self.strafe_dir
         elif outside_next:
-            move_x = zc[0] - pos[0]
-            move_y = zc[1] - pos[1]
+            move_x, move_y = zc[0] - pos[0], zc[1] - pos[1]
         else:
             if self.roam_target is None or dist2d(pos, self.roam_target) < 15.0:
                 ang = self.rng.uniform(0.0, 2.0 * math.pi)
@@ -473,8 +455,7 @@ class Bot:
                     clamp(zc[0] + math.cos(ang) * rad, self.map.bounds[0], self.map.bounds[1]),
                     clamp(zc[1] + math.sin(ang) * rad, self.map.bounds[2], self.map.bounds[3]),
                 )
-            move_x = self.roam_target[0] - pos[0]
-            move_y = self.roam_target[1] - pos[1]
+            move_x, move_y = self.roam_target[0] - pos[0], self.roam_target[1] - pos[1]
 
         mx, my = self.map.steer_around_walls(pos, move_x, move_y)
         action["move"] = [round(mx, 4), round(my, 4)]
@@ -489,7 +470,7 @@ class Bot:
                 self.roam_target = None
                 self.stuck_ticks = 0
 
-        # 6. Aiming & Firing (Tight aim tolerance so Gun mag isn't wasted)
+        # 6. Aiming & Firing (Restored 0.15 rad Gun window for max sustained DPS)
         if target is not None:
             tpos = target["pos"]
             tvel = target.get("vel", [0.0, 0.0, 0.0])
@@ -505,7 +486,6 @@ class Bot:
             lead_pt = self.lead_target(muzzle_pos, aim_center, tvel, gun_speed) if target_type != "crate" else aim_center
             des_yaw, des_pitch = self.aim_at_point(muzzle_pos, lead_pt)
             yaw_err = abs(angle_diff(des_yaw, cur_yaw))
-            pitch_err = abs(des_pitch - cur_pitch)
 
             fire_flags = [False, False]
             for s_idx, w in enumerate(weapons):
@@ -515,38 +495,34 @@ class Bot:
                 wstats = w.get("stats", {})
 
                 if kind == "lightning":
-                    l_range = wstats.get("range", 45.0)
-                    if target_los and d_target <= l_range - 1.0 and yaw_err < 0.48 and energy > 5.0:
+                    if target_los and d_target <= wstats.get("range", 45.0) - 1.0 and yaw_err < 0.48 and energy > 5.0:
                         fire_flags[s_idx] = True
 
                 elif kind == "gun":
-                    g_range = wstats.get("range", 230.0)
-                    if target_los and d_target <= g_range and yaw_err < 0.075 and pitch_err < 0.12 and w.get("reload", 0.0) <= 0.0:
+                    if target_los and d_target <= wstats.get("range", 230.0) and yaw_err < 0.15 and w.get("reload", 0.0) <= 0.0:
                         fire_flags[s_idx] = True
 
                 elif kind == "laser":
-                    l_range = wstats.get("range", 280.0)
                     charge = w.get("charge", 0.0)
                     full_charge = wstats.get("charge", 0.75)
                     min_charge = wstats.get("min_charge", 0.15)
-                    if target_type == "mech" and target_los and d_target <= l_range:
+                    if target_type == "mech" and target_los and d_target <= wstats.get("range", 280.0):
                         des_yaw, des_pitch = self.aim_at_point(muzzle_pos, aim_center)
                         yaw_err = abs(angle_diff(des_yaw, cur_yaw))
                         if charge == 0.0:
                             if w.get("cooldown", 0.0) <= 0.0 and yaw_err < 0.45:
                                 fire_flags[s_idx] = True
+                        elif (charge >= full_charge * 0.72 and yaw_err < 0.08) or (
+                            charge >= min_charge and target.get("hp", 1000) < 160 and yaw_err < 0.09
+                        ):
+                            fire_flags[s_idx] = False
                         else:
-                            if (charge >= full_charge * 0.75 and yaw_err < 0.07) or (
-                                charge >= min_charge and target.get("hp", 1000) < 160 and yaw_err < 0.08
-                            ):
-                                fire_flags[s_idx] = False
-                            else:
-                                fire_flags[s_idx] = True
+                            fire_flags[s_idx] = True
 
                 elif kind == "mortar":
                     if d_target <= 215.0 and d_target >= 18.0 and w.get("cooldown", 0.0) <= 0.0:
                         des_pitch = self.mortar_pitch(muzzle_pos, aim_center, wstats.get("speed", 72.0), wstats.get("gravity", 22.0))
-                        if yaw_err < 0.12:
+                        if yaw_err < 0.14:
                             fire_flags[s_idx] = True
 
             action["aim"] = [round(des_yaw, 4), round(des_pitch, 4)]
