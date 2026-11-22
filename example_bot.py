@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-ApexMech v12.0 - Regen-Disciplined Snowball Brawler (Built on V8.0's 4.21 base)
-- Exploits 45 HP/s out-of-combat regen by holding fire on far targets/crates when hurt
-- Auto-reloads Gun whenever target is behind cover
-- Gun + Lightning lock, 1.5x backstab priority, safe supply-drop full-heals
+ApexMech v13.0 - Smart Backstab Assassin + Balanced Regen (Built on V11's 4.33 base)
+- Smarter 1.5x rear-armor orbit: stays glued behind enemies & flips off walls
+- Balanced trigger discipline (<68% HP) to trigger 45 HP/s regen without starving loot
+- Execute focus on low-HP targets + LOS-break Gun reloading
 Standard library only. (<2ms/tick)
 """
 import json
@@ -165,7 +165,7 @@ class ArenaMap:
 
 
 class Bot:
-    name = "ApexMech-v12.0"
+    name = "ApexMech-v13.0"
 
     def __init__(self, hello: mf.Hello):
         self.slot = hello["slot"]
@@ -174,21 +174,21 @@ class Bot:
         self.map = ArenaMap(hello["map"]["dir"])
         self.pickup_r = self.config.get("loot", {}).get("pickup_radius", 4.0)
 
-        # Lock in Gun + Lightning (never drop Gun for Laser/Mortar)
+        # Lock in Gun + Lightning (360 DPS Lightning + 281 DPS Gun on rear armor!)
         self.weapon_rank = {"lightning": 5, "gun": 4, "laser": 3, "mortar": 1}
 
         self.upgrade_weights = {
             "armor": 100,
             "hp": 97,
-            "regen": 96,
             "lightning": 95,
+            "regen": 94,
             "gun_rate": 93,
             "gun_damage": 92,
-            "reload": 88,
-            "speed": 87,
-            "laser": 82,
-            "energy": 81,
-            "boost": 78,
+            "speed": 90,
+            "reload": 87,
+            "boost": 84,
+            "energy": 82,
+            "laser": 80,
             "sensors": 62,
             "mortar": 35,
         }
@@ -325,7 +325,7 @@ class Bot:
         zc = zone["next_center"]
         zr = zone["next_radius"]
 
-        # 4. Target Selection + Close-Threat Detection
+        # 4. Smart Assassin Target Selection (1.5x Backstab + Execute Focus)
         enemies.sort(key=lambda e: dist2d(pos, e["pos"]))
         near_enemies = [e for e in enemies if dist2d(pos, e["pos"]) < 85.0]
         target = None
@@ -339,25 +339,26 @@ class Bot:
                 ep = e["pos"]
                 d = dist2d(pos, ep)
                 los = self.map.has_los(muzzle_pos, (ep[0], ep[1], ep[2] + 4.5))
-                if los and d < 62.0:
+                if los and d < 55.0:
                     close_los_threat = True
-                hp_w = 0.45 + 0.55 * (e.get("hp", 1000) / max(e.get("max_hp", 1400), 1.0))
+                hp = e.get("hp", 1000.0)
+                hp_w = 0.45 + 0.55 * (hp / max(e.get("max_hp", 1400.0), 1.0))
 
-                # 1.5x rear-armor backstab priority
+                # 1.5x rear-armor backstab priority + low-HP execute priority
                 e_yaw = e.get("aim", [0.0, 0.0])[0]
                 back_err = abs(angle_diff(math.atan2(pos[1] - ep[1], pos[0] - ep[0]), e_yaw))
-                backstab_bonus = -25.0 if (los and back_err > 1.45) else 0.0
+                backstab_bonus = -30.0 if (los and back_err > 1.45) else 0.0
+                exec_bonus = -28.0 if (los and hp < 350.0) else 0.0
 
-                scored.append((d * hp_w + backstab_bonus + (0.0 if los else 130.0), los, e))
+                scored.append((d * hp_w + backstab_bonus + exec_bonus + (0.0 if los else 130.0), los, e))
             scored.sort(key=lambda x: x[0])
             _, target_los, target = scored[0]
             target_type = "mech"
 
-        # REGEN-DISCIPLINE: If hurt (<82% HP), in zone, and no close LOS threat,
-        # DON'T shoot far enemies/NPCs/crates so our 5s 45 HP/s regen timer completes!
-        preserve_regen = me["in_zone"] and hp_frac < 0.82 and not close_los_threat and (t - self.last_damage_t) > 1.0
+        # Balanced Trigger Discipline: only hold fire to heal if <68% HP, in zone, and no close LOS threat
+        preserve_regen = me["in_zone"] and hp_frac < 0.68 and not close_los_threat and (t - self.last_damage_t) > 0.8
 
-        # Farm NPCs/crates when healthy (or not preserving regen) and no close enemy
+        # Farm NPCs/crates when healthy (not preserving regen) and no close enemy (<65m)
         if not preserve_regen:
             if (target is None or (my_cubes < 15 and dist2d(pos, target["pos"]) > 65.0)) and npcs:
                 n = min(npcs, key=lambda x: dist2d(pos, x["pos"]))
@@ -372,7 +373,7 @@ class Bot:
                     if c_los or target is None:
                         target, target_type, target_los = c, "crate", c_los
 
-        # 5. Movement Decision
+        # 5. Movement Decision (Smart Assassin Orbit + Loot Balance + Multi-Bot Kite)
         move_x, move_y = 0.0, 0.0
         want_boost = False
 
@@ -380,19 +381,18 @@ class Bot:
         outside_next = d_zone > max(zr - 18.0, 5.0)
         urgent_zone = (not me["in_zone"]) or (d_zone > zr - 8.0 and t > zone["shrink_start"] - 12.0)
 
-        # Grab cubes immediately for instant heal + stats + 15-cube upgrade
+        # Always scoop nearby cubes (instant +4% heal & stats without breaking regen!)
         close_cube = None
         if cubes:
             c = min(cubes, key=lambda x: dist2d(pos, x["pos"]))
-            if dist2d(pos, c["pos"]) < (30.0 if near_enemies else 110.0):
+            if dist2d(pos, c["pos"]) < (30.0 if near_enemies else 115.0):
                 close_cube = c
 
-        # Safe supply-drop full-heal rotation
         best_drop = None
         for dr in drops:
             dd = dist2d(pos, dr["pos"])
-            if dr["lands_in"] < 20.0 and dd < (185.0 if (hp_frac < 0.75 or my_cubes < 10) else 100.0):
-                if len(near_enemies) == 0 or (len(near_enemies) == 1 and dd < 24.0):
+            if dr["lands_in"] < 20.0 and dd < (185.0 if (hp_frac < 0.72 or my_cubes < 10) else 100.0):
+                if len(near_enemies) <= 1 or dd < 24.0:
                     best_drop = dr
                     break
 
@@ -402,7 +402,7 @@ class Bot:
         elif close_cube is not None:
             move_x, move_y = close_cube["pos"][0] - pos[0], close_cube["pos"][1] - pos[1]
             want_boost = energy > 40.0 and dist2d(pos, close_cube["pos"]) > 12.0
-        elif best_drop is not None and (not near_enemies or hp_frac < 0.65):
+        elif best_drop is not None and (not near_enemies or hp_frac < 0.62):
             move_x, move_y = best_drop["pos"][0] - pos[0], best_drop["pos"][1] - pos[1]
             want_boost = energy > 35.0 and dist2d(pos, best_drop["pos"]) > best_drop["radius"]
         elif target_type == "mech":
@@ -420,31 +420,51 @@ class Bot:
                 move_y = ny * 0.72 + sy * 0.58 + (zy / zm) * 0.25
                 want_boost = energy > 30.0 and dist2d(pos, near_enemies[0]["pos"]) < 38.0
             else:
+                # SMART ASSASSIN 1v1: Orbit behind torso, glue to back once in rear arc!
                 ex, ey = target["pos"][0], target["pos"][1]
                 dx, dy = ex - pos[0], ey - pos[1]
                 d = max(math.hypot(dx, dy), 1e-4)
                 nx, ny = dx / d, dy / d
-                sx, sy = -ny * self.strafe_dir, nx * self.strafe_dir
+
+                e_yaw = target.get("aim", [0.0, 0.0])[0]
+                ang_e_to_me = math.atan2(pos[1] - ey, pos[0] - ex)
+                rel = angle_diff(ang_e_to_me, e_yaw)
 
                 if preserve_regen:
-                    # Keep distance while regenerating
+                    sx, sy = -ny * self.strafe_dir, nx * self.strafe_dir
                     move_x = -nx * 0.75 + sx * 0.65
                     move_y = -ny * 0.75 + sy * 0.65
                 else:
-                    ideal_dist = 36.0 if (has_lightning and hp_frac > 0.38) else 64.0
+                    # Pick flank direction toward their back; flip if a wall blocks that side
+                    flank_dir = -1.0 if rel >= 0.0 else 1.0
+                    sx, sy = -ny * flank_dir, nx * flank_dir
+                    if self.map.is_blocked_body(pos[0] + sx * 6.0, pos[1] + sy * 6.0, pos[2]):
+                        sx, sy = -sx, -sy
+
+                    ideal_dist = 28.0 if (has_lightning and hp_frac > 0.42) else 60.0
                     if hp_frac < 0.34:
                         move_x = -nx * 0.80 + sx * 0.60
                         move_y = -ny * 0.80 + sy * 0.60
                         want_boost = energy > 25.0
-                    elif d > ideal_dist + 9.0:
-                        move_x = nx * 0.65 + sx * 0.75
-                        move_y = ny * 0.65 + sy * 0.75
-                        want_boost = has_lightning and d < 62.0 and energy > 48.0
-                    elif d < ideal_dist - 9.0:
-                        move_x = -nx * 0.65 + sx * 0.75
-                        move_y = -ny * 0.65 + sy * 0.75
+                    elif abs(rel) > 1.65:
+                        # Already in their rear arc (1.5x dmg!): mirror distance & stay behind them
+                        if d > ideal_dist + 6.0:
+                            move_x, move_y = nx * 0.8 + sx * 0.2, ny * 0.8 + sy * 0.2
+                        elif d < ideal_dist - 6.0:
+                            move_x, move_y = -nx * 0.8 + sx * 0.2, -ny * 0.8 + sy * 0.2
+                        else:
+                            move_x, move_y = sx * 0.35, sy * 0.35
+                    elif d > ideal_dist + 8.0:
+                        move_x = nx * 0.60 + sx * 0.80
+                        move_y = ny * 0.60 + sy * 0.80
+                        want_boost = has_lightning and d < 58.0 and energy > 45.0
+                    elif d < ideal_dist - 8.0:
+                        move_x = -nx * 0.55 + sx * 0.83
+                        move_y = -ny * 0.55 + sy * 0.83
                     else:
                         move_x, move_y = sx, sy
+                        if has_lightning and d < 36.0 and 0.75 < abs(rel) < 1.65 and energy > 45.0:
+                            want_boost = True
 
             if target.get("charging"):
                 ex, ey = target["pos"][0], target["pos"][1]
@@ -508,7 +528,6 @@ class Bot:
             yaw_err = abs(angle_diff(des_yaw, cur_yaw))
 
             fire_flags = [False, False]
-            # Only fire if we are NOT preserving out-of-combat regen
             if not preserve_regen:
                 for s_idx, w in enumerate(weapons):
                     if w is None:
