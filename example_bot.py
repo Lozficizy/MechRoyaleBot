@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-ApexMech v16.0 - V11.0 (4.33) Refined Assassin
-Built directly on V11.0 with 4 surgical upgrades:
-1. Exact 3D quadratic intercept aimbot (keeping V11's 0.15 rad fire window)
-2. Wall-aware blind-spot flanking (flips orbit direction if a wall blocks the flank)
-3. Hard-locked Gun + Lightning (stops detouring for pickups once armed)
-4. Free Gun reloads only when target is behind cover (<50% mag)
+ApexMech v17.0 - Hyper-Aggressive Assassin (Built directly on V11.0's 4.33 base)
+- Keeps V11.0's exact map, aiming, and cube snowball intact
+- Tighter 25m Lightning orbit + lower 22% retreat threshold
+- Aggressive boost-chasing & blind-spot flanking (energy > 30)
+- Stays in Lightning chain range during 1v2s when healthy + low-HP execute focus
 Standard library only. (<2ms/tick)
 """
 import json
@@ -167,7 +166,7 @@ class ArenaMap:
 
 
 class Bot:
-    name = "ApexMech-v16.0"
+    name = "ApexMech-v17.0"
 
     def __init__(self, hello: mf.Hello):
         self.slot = hello["slot"]
@@ -176,20 +175,21 @@ class Bot:
         self.map = ArenaMap(hello["map"]["dir"])
         self.pickup_r = self.config.get("loot", {}).get("pickup_radius", 4.0)
 
-        # Lock in Gun + Lightning (360 DPS Lightning + 281 DPS Gun on rear armor)
+        # Lock in Gun + Lightning (360 DPS Lightning + 281 DPS Gun on rear armor!)
         self.weapon_rank = {"lightning": 5, "gun": 4, "laser": 3, "mortar": 1}
 
+        # Hyper-aggressive DPS + Armor/HP upgrades
         self.upgrade_weights = {
             "armor": 100,
+            "lightning": 98,
             "hp": 97,
-            "lightning": 95,
-            "gun_rate": 93,
-            "gun_damage": 92,
-            "speed": 90,
-            "regen": 89,
-            "reload": 86,
-            "boost": 84,
-            "energy": 82,
+            "gun_rate": 96,
+            "gun_damage": 95,
+            "speed": 92,
+            "reload": 89,
+            "regen": 88,
+            "boost": 86,
+            "energy": 84,
             "laser": 80,
             "sensors": 62,
             "mortar": 35,
@@ -223,39 +223,17 @@ class Bot:
         dz = target_pos[2] - muzzle_pos[2]
         return math.atan2(dy, dx), clamp(math.atan2(dz, max(math.hypot(dx, dy), 1e-4)), -1.2, 1.2)
 
-    def solve_intercept(self, muzzle_pos, target_pos, target_vel, proj_speed: float):
-        """Exact 3D quadratic intercept solver for moving targets."""
-        rx = target_pos[0] - muzzle_pos[0]
-        ry = target_pos[1] - muzzle_pos[1]
-        rz = target_pos[2] - muzzle_pos[2]
-        vx, vy, vz = target_vel[0], target_vel[1], target_vel[2]
-
-        a = vx * vx + vy * vy + vz * vz - proj_speed * proj_speed
-        b = 2.0 * (rx * vx + ry * vy + rz * vz)
-        c = rx * rx + ry * ry + rz * rz
-
-        t_hit = 0.0
-        if abs(a) < 1e-6:
-            if abs(b) > 1e-6:
-                t_hit = max(0.0, -c / b)
-        else:
-            disc = b * b - 4.0 * a * c
-            if disc >= 0.0:
-                sqrt_d = math.sqrt(disc)
-                t1 = (-b - sqrt_d) / (2.0 * a)
-                t2 = (-b + sqrt_d) / (2.0 * a)
-                if t1 > 0.0 and t2 > 0.0:
-                    t_hit = min(t1, t2)
-                elif t1 > 0.0:
-                    t_hit = t1
-                elif t2 > 0.0:
-                    t_hit = t2
-
-        t_hit = clamp(t_hit, 0.0, 1.2)
+    def lead_target(self, muzzle_pos, target_pos, target_vel, proj_speed: float):
+        d = dist3d(muzzle_pos, target_pos)
+        t_flight = d / max(proj_speed, 1.0)
+        px = target_pos[0] + target_vel[0] * t_flight
+        py = target_pos[1] + target_vel[1] * t_flight
+        pz = target_pos[2] + target_vel[2] * t_flight
+        t_flight = dist3d(muzzle_pos, (px, py, pz)) / max(proj_speed, 1.0)
         return (
-            target_pos[0] + vx * t_hit,
-            target_pos[1] + vy * t_hit,
-            target_pos[2] + vz * t_hit,
+            target_pos[0] + target_vel[0] * t_flight,
+            target_pos[1] + target_vel[1] * t_flight,
+            target_pos[2] + target_vel[2] * t_flight,
         )
 
     def mortar_pitch(self, muzzle_pos, target_pos, speed: float, gravity: float) -> float:
@@ -312,33 +290,30 @@ class Bot:
         if obs.get("offer") is not None:
             action["pick"] = self.pick_upgrade(obs["offer"])
 
-        # 2. Weapon pickup / swap (Hard-lock Gun + Lightning)
+        # 2. Weapon pickup / swap
         held_kinds = {w["kind"] for w in weapons if w is not None}
         has_lightning = "lightning" in held_kinds
-        has_bis = has_lightning and ("gun" in held_kinds)
         empty_slot = 0 if weapons[0] is None else (1 if weapons[1] is None else None)
-
-        if not has_bis:
-            for p in obs.get("pickups", []):
-                if p["kind"] in held_kinds:
-                    continue
-                if dist2d(pos, p["pos"]) <= self.pickup_r - 0.15 and abs(pos[2] - p["pos"][2]) <= 3.8:
-                    if empty_slot is not None:
-                        action["take"] = p["id"]
-                        break
-                    worst_slot = None
-                    worst_rank = self.weapon_rank.get(p["kind"], 0)
-                    for s_idx, w in enumerate(weapons):
-                        if w["kind"] == "laser" and w.get("charge", 0) > 0:
-                            continue
-                        r = self.weapon_rank.get(w["kind"], 0)
-                        if r < worst_rank:
-                            worst_rank = r
-                            worst_slot = s_idx
-                    if worst_slot is not None:
-                        action["take"] = p["id"]
-                        action["drop"] = worst_slot
-                        break
+        for p in obs.get("pickups", []):
+            if p["kind"] in held_kinds:
+                continue
+            if dist2d(pos, p["pos"]) <= self.pickup_r - 0.15 and abs(pos[2] - p["pos"][2]) <= 3.8:
+                if empty_slot is not None:
+                    action["take"] = p["id"]
+                    break
+                worst_slot = None
+                worst_rank = self.weapon_rank.get(p["kind"], 0)
+                for s_idx, w in enumerate(weapons):
+                    if w["kind"] == "laser" and w.get("charge", 0) > 0:
+                        continue
+                    r = self.weapon_rank.get(w["kind"], 0)
+                    if r < worst_rank:
+                        worst_rank = r
+                        worst_slot = s_idx
+                if worst_slot is not None:
+                    action["take"] = p["id"]
+                    action["drop"] = worst_slot
+                    break
 
         # 3. Classify visible entities
         enemies = [m for m in obs.get("mechs", []) if m["kind"] == "mech"]
@@ -351,7 +326,7 @@ class Bot:
         zc = zone["next_center"]
         zr = zone["next_radius"]
 
-        # 4. Assassin Target Selection (bonus for back-turned enemies -> 1.5x rear dmg)
+        # 4. Aggressive Assassin Target Selection (1.5x Backstab + Execute Focus)
         enemies.sort(key=lambda e: dist2d(pos, e["pos"]))
         near_enemies = [e for e in enemies if dist2d(pos, e["pos"]) < 85.0]
         target = None
@@ -364,14 +339,16 @@ class Bot:
                 ep = e["pos"]
                 d = dist2d(pos, ep)
                 los = self.map.has_los(muzzle_pos, (ep[0], ep[1], ep[2] + 4.5))
-                hp_w = 0.45 + 0.55 * (e.get("hp", 1000) / max(e.get("max_hp", 1400), 1.0))
+                hp = e.get("hp", 1000.0)
+                hp_w = 0.42 + 0.58 * (hp / max(e.get("max_hp", 1400.0), 1.0))
 
                 e_yaw = e.get("aim", [0.0, 0.0])[0]
                 ang_e_to_me = math.atan2(pos[1] - ep[1], pos[0] - ep[0])
                 back_err = abs(angle_diff(ang_e_to_me, e_yaw))
-                backstab_bonus = -30.0 if (los and back_err > 1.45) else 0.0
+                backstab_bonus = -32.0 if (los and back_err > 1.45) else 0.0
+                exec_bonus = -35.0 if (los and hp < 350.0) else 0.0
 
-                scored.append((d * hp_w + backstab_bonus + (0.0 if los else 130.0), los, e))
+                scored.append((d * hp_w + backstab_bonus + exec_bonus + (0.0 if los else 130.0), los, e))
             scored.sort(key=lambda x: x[0])
             _, target_los, target = scored[0]
             target_type = "mech"
@@ -390,7 +367,7 @@ class Bot:
                 if c_los or target is None:
                     target, target_type, target_los = c, "crate", c_los
 
-        # 5. Movement Decision (Wall-Aware Blind-Spot Flanking + Multi-Bot Kite)
+        # 5. Movement Decision (Hyper-Aggressive Blind-Spot Flanking + Chain-Range Kiting)
         move_x, move_y = 0.0, 0.0
         want_boost = False
 
@@ -417,12 +394,13 @@ class Bot:
             want_boost = energy > 22.0
         elif close_cube is not None:
             move_x, move_y = close_cube["pos"][0] - pos[0], close_cube["pos"][1] - pos[1]
-            want_boost = energy > 40.0 and dist2d(pos, close_cube["pos"]) > 12.0
+            want_boost = energy > 35.0 and dist2d(pos, close_cube["pos"]) > 12.0
         elif best_drop is not None and (not near_enemies or hp_frac < 0.60):
             move_x, move_y = best_drop["pos"][0] - pos[0], best_drop["pos"][1] - pos[1]
             want_boost = energy > 35.0 and dist2d(pos, best_drop["pos"]) > best_drop["radius"]
         elif target_type == "mech":
-            if len(near_enemies) >= 2:
+            if len(near_enemies) >= 2 and not (len(near_enemies) == 2 and has_lightning and hp_frac > 0.38):
+                # Multi-bot kite when low HP or 3+ bots
                 cx = sum(e["pos"][0] for e in near_enemies) / len(near_enemies)
                 cy = sum(e["pos"][1] for e in near_enemies) / len(near_enemies)
                 dx, dy = pos[0] - cx, pos[1] - cy
@@ -431,10 +409,11 @@ class Bot:
                 sx, sy = -ny * self.strafe_dir, nx * self.strafe_dir
                 zx, zy = zc[0] - pos[0], zc[1] - pos[1]
                 zm = max(math.hypot(zx, zy), 1e-4)
-                move_x = nx * 0.72 + sx * 0.58 + (zx / zm) * 0.25
-                move_y = ny * 0.72 + sy * 0.58 + (zy / zm) * 0.25
-                want_boost = energy > 30.0 and dist2d(pos, near_enemies[0]["pos"]) < 38.0
+                move_x = nx * 0.70 + sx * 0.60 + (zx / zm) * 0.25
+                move_y = ny * 0.70 + sy * 0.60 + (zy / zm) * 0.25
+                want_boost = energy > 28.0 and dist2d(pos, near_enemies[0]["pos"]) < 38.0
             else:
+                # HYPER-AGGRESSIVE ASSASSIN ORBIT (also used in healthy 1v2s to chain Lightning!)
                 ex, ey = target["pos"][0], target["pos"][1]
                 dx, dy = ex - pos[0], ey - pos[1]
                 d = max(math.hypot(dx, dy), 1e-4)
@@ -445,25 +424,25 @@ class Bot:
                 rel = angle_diff(ang_e_to_me, e_yaw)
                 flank_dir = -1.0 if rel >= 0.0 else 1.0
                 sx, sy = -ny * flank_dir, nx * flank_dir
-                # Flip flank if a wall blocks our orbit
-                if self.map.is_blocked_body(pos[0] + sx * 6.0, pos[1] + sy * 6.0, pos[2]):
-                    sx, sy = -sx, -sy
 
-                ideal_dist = 28.0 if (has_lightning and hp_frac > 0.42) else 60.0
-                if hp_frac < 0.34:
+                ideal_dist = 25.0 if (has_lightning and hp_frac > 0.25) else 52.0
+                if len(near_enemies) == 2:
+                    ideal_dist = 33.0  # Stay right in Lightning chain sweet spot
+
+                if hp_frac < 0.22:
                     move_x = -nx * 0.80 + sx * 0.60
                     move_y = -ny * 0.80 + sy * 0.60
-                    want_boost = energy > 25.0
-                elif d > ideal_dist + 8.0:
-                    move_x = nx * 0.60 + sx * 0.80
-                    move_y = ny * 0.60 + sy * 0.80
-                    want_boost = has_lightning and d < 58.0 and energy > 45.0
-                elif d < ideal_dist - 8.0:
-                    move_x = -nx * 0.55 + sx * 0.83
-                    move_y = -ny * 0.55 + sy * 0.83
+                    want_boost = energy > 22.0
+                elif d > ideal_dist + 7.0:
+                    move_x = nx * 0.70 + sx * 0.72
+                    move_y = ny * 0.70 + sy * 0.72
+                    want_boost = has_lightning and d < 72.0 and energy > 30.0
+                elif d < ideal_dist - 7.0:
+                    move_x = -nx * 0.50 + sx * 0.86
+                    move_y = -ny * 0.50 + sy * 0.86
                 else:
                     move_x, move_y = sx, sy
-                    if has_lightning and d < 36.0 and 0.75 < abs(rel) < 1.85 and energy > 45.0:
+                    if has_lightning and d < 38.0 and 0.65 < abs(rel) < 1.95 and energy > 30.0:
                         want_boost = True
 
             if target.get("charging"):
@@ -471,14 +450,14 @@ class Bot:
                 dx, dy = ex - pos[0], ey - pos[1]
                 d = max(math.hypot(dx, dy), 1e-4)
                 move_x, move_y = (-dy / d) * self.strafe_dir, (dx / d) * self.strafe_dir
-                want_boost = energy > 18.0
-        elif not has_bis and pickups:
+                want_boost = energy > 15.0
+        elif (empty_slot is not None or not has_lightning) and pickups:
             lp = [p for p in pickups if p["kind"] == "lightning"]
             valid_p = lp if (lp and not has_lightning) else [p for p in pickups if p["kind"] not in held_kinds]
             if valid_p:
                 p = min(valid_p, key=lambda x: dist2d(pos, x["pos"]))
                 move_x, move_y = p["pos"][0] - pos[0], p["pos"][1] - pos[1]
-                want_boost = energy > 50.0
+                want_boost = energy > 40.0
         elif target_type in ("npc", "crate"):
             dx, dy = target["pos"][0] - pos[0], target["pos"][1] - pos[1]
             if math.hypot(dx, dy) > 26.0:
@@ -523,7 +502,7 @@ class Bot:
                 if w and w["kind"] == "gun":
                     gun_speed = w["stats"].get("speed", 252.0)
 
-            lead_pt = self.solve_intercept(muzzle_pos, aim_center, tvel, gun_speed) if target_type != "crate" else aim_center
+            lead_pt = self.lead_target(muzzle_pos, aim_center, tvel, gun_speed) if target_type != "crate" else aim_center
             des_yaw, des_pitch = self.aim_at_point(muzzle_pos, lead_pt)
             yaw_err = abs(angle_diff(des_yaw, cur_yaw))
 
@@ -564,13 +543,6 @@ class Bot:
                         des_pitch = self.mortar_pitch(muzzle_pos, aim_center, wstats.get("speed", 72.0), wstats.get("gravity", 22.0))
                         if yaw_err < 0.14:
                             fire_flags[s_idx] = True
-
-            # Free cover-reload only when target is behind a wall and mag < 50%
-            if not target_los:
-                for w in weapons:
-                    if w and w["kind"] == "gun" and w.get("reload", 0.0) <= 0.0:
-                        if w.get("ammo", 12) < w["stats"].get("mag", 12) * 0.5:
-                            action["reload"] = True
 
             action["aim"] = [round(des_yaw, 4), round(des_pitch, 4)]
             action["fire"] = fire_flags
