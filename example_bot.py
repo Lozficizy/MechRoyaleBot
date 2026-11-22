@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-ApexMech v9.0 - Upgraded Snowball + Drop-Lock + CPA Dodge + Laser Short (mechfight/1)
-Built directly on V8.0 (4.21). Standard library only. (<2ms/tick)
+ApexMech v10.0 - 1v5 Clutch Edition (Built directly on V8.0's 4.21 base)
+- League ADC focus-fire & execute lock (finish kills to delete DPS + spawn cubes)
+- 1/d^2 weighted tether-kiting against multi-bot swarms
+- Fortnite corner-hugging wall steer to split pursuers into 1v1s
+- Safe supply-drop logic + strict energy discipline for Lightning & Laser dodges
+Standard library only. (<2ms/tick)
 """
 import json
 import math
@@ -144,25 +148,40 @@ class ArenaMap:
             z += dz
         return True
 
-    def steer_around_walls(self, pos, desired_dx: float, desired_dy: float):
+    def steer_around_walls(self, pos, desired_dx: float, desired_dy: float, hug_cover: bool = False):
         mag = math.hypot(desired_dx, desired_dy)
         if mag < 1e-4:
             return 0.0, 0.0
         base_ang = math.atan2(desired_dy, desired_dx)
         x, y, z = pos[0], pos[1], pos[2]
-        for off in (0.0, 0.35, -0.35, 0.7, -0.7, 1.1, -1.1, 1.55, -1.55, 2.1, -2.1):
+        offsets = (0.0, 0.35, -0.35, 0.7, -0.7, 1.1, -1.1, 1.55, -1.55, 2.1, -2.1)
+
+        best_open = None
+        for off in offsets:
             ang = base_ang + off
             ca, sa = math.cos(ang), math.sin(ang)
             if (
                 not self.is_blocked_body(x + ca * 4.5, y + sa * 4.5, z)
                 and not self.is_blocked_body(x + ca * 9.0, y + sa * 9.0, z)
             ):
-                return ca, sa
+                if not hug_cover:
+                    return ca, sa
+                if best_open is None:
+                    best_open = (ca, sa)
+                # Fortnite corner-hug: prefer an open path that runs alongside a building wall
+                lx, ly = -sa * 6.5, ca * 6.5
+                if (
+                    self.is_blocked_body(x + ca * 6.0 + lx, y + sa * 6.0 + ly, z)
+                    or self.is_blocked_body(x + ca * 6.0 - lx, y + sa * 6.0 - ly, z)
+                ):
+                    return ca, sa
+        if best_open is not None:
+            return best_open
         return desired_dx / mag, desired_dy / mag
 
 
 class Bot:
-    name = "ApexMech-v9.0"
+    name = "ApexMech-v10.0"
 
     def __init__(self, hello: mf.Hello):
         self.slot = hello["slot"]
@@ -171,7 +190,7 @@ class Bot:
         self.map = ArenaMap(hello["map"]["dir"])
         self.pickup_r = self.config.get("loot", {}).get("pickup_radius", 4.0)
 
-        # Lock in Gun + Lightning
+        # Lock in Gun + Lightning (highest sustained 1v5 DPS + chain)
         self.weapon_rank = {"lightning": 5, "gun": 4, "laser": 3, "mortar": 1}
 
         self.upgrade_weights = {
@@ -182,9 +201,9 @@ class Bot:
             "gun_damage": 92,
             "regen": 90,
             "reload": 87,
-            "speed": 85,
+            "speed": 86,
             "laser": 82,
-            "energy": 80,
+            "energy": 81,
             "boost": 76,
             "sensors": 62,
             "mortar": 35,
@@ -198,6 +217,7 @@ class Bot:
         self.last_damage_bearing = None
         self.last_damage_t = -10.0
         self.roam_target = None
+        self.locked_id = None
 
     def pick_upgrade(self, offer) -> int:
         best_i, best_score = 0, -1e9
@@ -241,32 +261,6 @@ class Bot:
         if disc < 0:
             return 0.78
         return clamp(math.atan((v2 - math.sqrt(disc)) / (gravity * r)), -0.5, 1.3)
-
-    def incoming_projectile_dodge(self, pos, projectiles):
-        """Lightweight CPA dodge: only dodges bullets/mortars about to hit us."""
-        mx, my = pos[0], pos[1]
-        for p in projectiles:
-            px, py = p["pos"][0], p["pos"][1]
-            vx, vy = p["vel"][0], p["vel"][1]
-            spd2 = vx * vx + vy * vy
-            if spd2 < 10.0:
-                continue
-            rx, ry = mx - px, my - py
-            if rx * rx + ry * ry > 45.0 * 45.0:
-                continue
-            dot = rx * vx + ry * vy
-            if dot <= 0.0:
-                continue
-            t_cpa = dot / spd2
-            if t_cpa > 0.65:
-                continue
-            cpa_x = px + vx * t_cpa - mx
-            cpa_y = py + vy * t_cpa - my
-            hit_r = 7.5 if p["kind"] == "mortar" else 5.0
-            if cpa_x * cpa_x + cpa_y * cpa_y < hit_r * hit_r:
-                spd = math.sqrt(spd2)
-                return (-vy / spd) * self.strafe_dir, (vx / spd) * self.strafe_dir, p["kind"] == "mortar"
-        return None
 
     def act(self, obs: mf.Observation) -> mf.Action:
         t = obs["t"]
@@ -347,7 +341,7 @@ class Bot:
         zc = zone["next_center"]
         zr = zone["next_radius"]
 
-        # 4. Target Selection (with Laser-Short priority!)
+        # 4. Target Selection (1v5 Focus-Fire & Execute Lock!)
         enemies.sort(key=lambda e: dist2d(pos, e["pos"]))
         near_enemies = [e for e in enemies if dist2d(pos, e["pos"]) < 85.0]
         target = None
@@ -360,15 +354,23 @@ class Bot:
                 ep = e["pos"]
                 d = dist2d(pos, ep)
                 los = self.map.has_los(muzzle_pos, (ep[0], ep[1], ep[2] + 4.5))
-                hp_w = 0.45 + 0.55 * (e.get("hp", 1000) / max(e.get("max_hp", 1400), 1.0))
-                # High priority to short a charging laser within Lightning range!
-                short_bonus = -55.0 if (has_lightning and los and d < 44.0 and e.get("charging")) else 0.0
-                scored.append((d * hp_w + short_bonus + (0.0 if los else 130.0), los, e))
+                hp = e.get("hp", 1000.0)
+                max_hp = max(e.get("max_hp", 1400.0), 1.0)
+                hp_ratio = hp / max_hp
+
+                # Strong execute focus: finish low-HP targets to remove their DPS immediately
+                exec_bonus = -35.0 if (los and hp < 320.0) else 0.0
+                lock_bonus = -18.0 if (los and e["id"] == self.locked_id and hp_ratio < 0.75) else 0.0
+                sc = d * (0.40 + 0.60 * hp_ratio) + exec_bonus + lock_bonus + (0.0 if los else 135.0)
+                scored.append((sc, los, e))
             scored.sort(key=lambda x: x[0])
             _, target_los, target = scored[0]
             target_type = "mech"
+            self.locked_id = target["id"]
+        else:
+            self.locked_id = None
 
-        # Farm NPCs/crates when under 10 cubes (stat_cap) and no close enemy
+        # Early-game cube snowball (farm NPCs/crates when under 10 cubes & no close enemy)
         if my_cubes < 10:
             if (target is None or dist2d(pos, target["pos"]) > 65.0) and npcs:
                 n = min(npcs, key=lambda x: dist2d(pos, x["pos"]))
@@ -383,70 +385,62 @@ class Bot:
                     if c_los or target is None:
                         target, target_type, target_los = c, "crate", c_los
 
-        # 5. Movement Decision
+        # 5. Movement Decision (1v5 League ADC Tether-Kiting + Fortnite Corner-Hug)
         move_x, move_y = 0.0, 0.0
         want_boost = False
+        hug_cover = len(near_enemies) >= 2
 
         d_zone = dist2d(pos, zc)
         outside_next = d_zone > max(zr - 18.0, 5.0)
         urgent_zone = (not me["in_zone"]) or (d_zone > zr - 8.0 and t > zone["shrink_start"] - 12.0)
 
-        # Grab cubes up to 10 (instant heal + +4% HP/DMG); after 10 only grab if right next to us
+        # Grab cubes for instant heal + dmg buff (up to 10 aggressively, >10 only if right next to us)
         close_cube = None
         if cubes:
             c = min(cubes, key=lambda x: dist2d(pos, x["pos"]))
             cd = dist2d(pos, c["pos"])
             if my_cubes < 10 and cd < (30.0 if near_enemies else 110.0):
                 close_cube = c
-            elif my_cubes < 15 and cd < 14.0:
+            elif cd < 14.0:
                 close_cube = c
 
-        # Supply Drop Ring-Lock (full HP + full energy + 3 cubes!)
-        capturing_drop = None
+        # Safe supply-drop full-heal (never suicide into 2+ enemies for a drop)
         best_drop = None
         for dr in drops:
             dd = dist2d(pos, dr["pos"])
-            if dr["lands_in"] == 0.0 and dd < 22.0 and (hp_frac < 0.90 or my_cubes < 10 or dr.get("holder") == me["id"]):
-                capturing_drop = dr
-                break
-            if dr["lands_in"] < 20.0 and dd < (185.0 if (hp_frac < 0.72 or my_cubes < 10) else 100.0):
-                if len(near_enemies) <= 1 or dd < 28.0:
+            if dr["lands_in"] < 20.0 and dd < (180.0 if (hp_frac < 0.72 or my_cubes < 10) else 100.0):
+                if len(near_enemies) == 0 or (len(near_enemies) == 1 and dd < 24.0):
                     best_drop = dr
+                    break
 
         if urgent_zone:
             move_x, move_y = zc[0] - pos[0], zc[1] - pos[1]
             want_boost = energy > 22.0
-        elif capturing_drop is not None:
-            # Stay inside the 8m capture ring while strafing!
-            dp = capturing_drop["pos"]
-            dd = dist2d(pos, dp)
-            if dd > capturing_drop["radius"] - 2.2:
-                move_x, move_y = dp[0] - pos[0], dp[1] - pos[1]
-                want_boost = energy > 30.0 and dd > capturing_drop["radius"]
-            else:
-                # Strafe gently inside the ring
-                dx, dy = dp[0] - pos[0], dp[1] - pos[1]
-                move_x = dx * 0.4 - dy * self.strafe_dir * 0.6
-                move_y = dy * 0.4 + dx * self.strafe_dir * 0.6
         elif close_cube is not None:
             move_x, move_y = close_cube["pos"][0] - pos[0], close_cube["pos"][1] - pos[1]
-            want_boost = energy > 40.0 and dist2d(pos, close_cube["pos"]) > 12.0
-        elif best_drop is not None and (not near_enemies or hp_frac < 0.62):
+            want_boost = energy > 45.0 and dist2d(pos, close_cube["pos"]) > 12.0
+        elif best_drop is not None and (not near_enemies or hp_frac < 0.60):
             move_x, move_y = best_drop["pos"][0] - pos[0], best_drop["pos"][1] - pos[1]
-            want_boost = energy > 35.0 and dist2d(pos, best_drop["pos"]) > best_drop["radius"]
+            want_boost = energy > 40.0 and dist2d(pos, best_drop["pos"]) > best_drop["radius"]
         elif target_type == "mech":
             if len(near_enemies) >= 2:
-                cx = sum(e["pos"][0] for e in near_enemies) / len(near_enemies)
-                cy = sum(e["pos"][1] for e in near_enemies) / len(near_enemies)
-                dx, dy = pos[0] - cx, pos[1] - cy
-                d = max(math.hypot(dx, dy), 1e-4)
-                nx, ny = dx / d, dy / d
+                # 1/d^2 weighted ADC tether-kiting away from closest divers
+                rx, ry = 0.0, 0.0
+                for e in near_enemies[:4]:
+                    dx = pos[0] - e["pos"][0]
+                    dy = pos[1] - e["pos"][1]
+                    d2 = max(dx * dx + dy * dy, 25.0)
+                    w = 1000.0 / d2
+                    rx += (dx / math.sqrt(d2)) * w
+                    ry += (dy / math.sqrt(d2)) * w
+                rm = max(math.hypot(rx, ry), 1e-4)
+                nx, ny = rx / rm, ry / rm
                 sx, sy = -ny * self.strafe_dir, nx * self.strafe_dir
                 zx, zy = zc[0] - pos[0], zc[1] - pos[1]
                 zm = max(math.hypot(zx, zy), 1e-4)
-                move_x = nx * 0.72 + sx * 0.58 + (zx / zm) * 0.25
-                move_y = ny * 0.72 + sy * 0.58 + (zy / zm) * 0.25
-                want_boost = energy > 30.0 and dist2d(pos, near_enemies[0]["pos"]) < 38.0
+                move_x = nx * 0.75 + sx * 0.52 + (zx / zm) * 0.28
+                move_y = ny * 0.75 + sy * 0.52 + (zy / zm) * 0.28
+                want_boost = energy > 32.0 and dist2d(pos, near_enemies[0]["pos"]) < 36.0
             else:
                 ex, ey = target["pos"][0], target["pos"][1]
                 dx, dy = ex - pos[0], ey - pos[1]
@@ -454,27 +448,28 @@ class Bot:
                 nx, ny = dx / d, dy / d
                 sx, sy = -ny * self.strafe_dir, nx * self.strafe_dir
 
-                ideal_dist = 35.0 if (has_lightning and hp_frac > 0.36) else 64.0
+                ideal_dist = 36.0 if (has_lightning and hp_frac > 0.36) else 64.0
                 if hp_frac < 0.34:
                     move_x = -nx * 0.80 + sx * 0.60
                     move_y = -ny * 0.80 + sy * 0.60
-                    want_boost = energy > 25.0
+                    want_boost = energy > 28.0
                 elif d > ideal_dist + 9.0:
                     move_x = nx * 0.65 + sx * 0.75
                     move_y = ny * 0.65 + sy * 0.75
-                    want_boost = has_lightning and d < 62.0 and energy > 48.0
+                    want_boost = has_lightning and d < 62.0 and energy > 50.0
                 elif d < ideal_dist - 9.0:
                     move_x = -nx * 0.65 + sx * 0.75
                     move_y = -ny * 0.65 + sy * 0.75
                 else:
                     move_x, move_y = sx, sy
 
+            # Immediate perpendicular boost-dodge against charging lasers
             if target.get("charging"):
                 ex, ey = target["pos"][0], target["pos"][1]
                 dx, dy = ex - pos[0], ey - pos[1]
                 d = max(math.hypot(dx, dy), 1e-4)
                 move_x, move_y = (-dy / d) * self.strafe_dir, (dx / d) * self.strafe_dir
-                want_boost = energy > 18.0
+                want_boost = energy > 15.0
         elif (empty_slot is not None or not has_lightning) and pickups:
             lp = [p for p in pickups if p["kind"] == "lightning"]
             valid_p = lp if (lp and not has_lightning) else [p for p in pickups if p["kind"] not in held_kinds]
@@ -484,7 +479,7 @@ class Bot:
                 want_boost = energy > 50.0
         elif target_type in ("npc", "crate"):
             dx, dy = target["pos"][0] - pos[0], target["pos"][1] - pos[1]
-            if math.hypot(dx, dy) > 34.0:
+            if math.hypot(dx, dy) > 28.0:
                 move_x, move_y = dx, dy
             else:
                 move_x, move_y = -dy * self.strafe_dir, dx * self.strafe_dir
@@ -500,16 +495,7 @@ class Bot:
                 )
             move_x, move_y = self.roam_target[0] - pos[0], self.roam_target[1] - pos[1]
 
-        # Overlay CPA projectile dodge (unless locked inside a supply drop ring)
-        if capturing_drop is None:
-            dodge = self.incoming_projectile_dodge(pos, obs.get("projectiles", []))
-            if dodge is not None:
-                move_x = move_x * 0.35 + dodge[0] * 0.95
-                move_y = move_y * 0.35 + dodge[1] * 0.95
-                if dodge[2] and energy > 20.0:
-                    want_boost = True
-
-        mx, my = self.map.steer_around_walls(pos, move_x, move_y)
+        mx, my = self.map.steer_around_walls(pos, move_x, move_y, hug_cover=hug_cover)
         action["move"] = [round(mx, 4), round(my, 4)]
         action["boost"] = want_boost
         if self.stuck_ticks >= 4:
