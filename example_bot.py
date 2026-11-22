@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-ApexMech v22.0 - v18 core (best 4.42) + flagged survival upgrades.
-Flip the flags below to A/B one change per submission.
+ApexMech v23.1 - v18 core (4.42) + Fixed Stealth-Heal & Laser Dodge
+Fixes over v23.0:
+- Removed cowardly `outgunned` retreat trigger; lowered heal entry to 0.42 & exit to 0.75
+- Holds fire while breaking LOS in heal mode (unless point-blank <35m) so the 5s regen timer starts immediately
+- Still scoops close cubes (<20m) during heal mode; LIGHTNING_RESERVE disabled by default
 Standard library only.
 """
 import json
@@ -11,12 +14,19 @@ import random
 import mechfight as mf
 
 # ---------------- A/B FLAGS ----------------
-EVADE_ENABLED = True        # break LOS / flee when 3+ enemies close (v18 isolation still handles 2)
+HEAL_HIDE = True            # break contact + stand still to use 45 HP/s regen when hurt
+HEAL_ENTER_FRAC = 0.42      # only heal when genuinely low
+HEAL_EXIT_FRAC = 0.75       # resume fighting quickly to keep kill/loot tempo
+EVADE_ENABLED = True        # break LOS / flee when 3+ enemies close (v18 isolation handles 2)
 NO_CHASE = True             # don't pursue mechs farther than CHASE_MAX
 CHASE_MAX = 110.0
-LIGHTNING_RESERVE = True    # keep energy for boosting away; don't dump it all in lightning
-GATED_RUSH = False          # only close to 27m lightning range when healthy & target hurt
-EARLY_PASSIVE_S = 0.0       # e.g. 45.0: don't approach mechs >70m away during first N seconds
+LIGHTNING_RESERVE = False   # don't starve Lightning DPS mid-duel
+LASER_DODGE = True          # sidestep any charging laser aimed at us
+AVOID_MORTAR = True         # don't pick up mortars
+DROP_HOLD = True            # stop inside a supply-drop ring instead of oscillating
+GATED_RUSH = False          # keep full 27m Lightning aggression in 1v1s
+EARLY_PASSIVE_S = 0.0
+STRAFE_PERIOD = (6, 9)
 LOGGING = True
 # -------------------------------------------
 
@@ -168,7 +178,7 @@ class ArenaMap:
         for off in (0.0, 0.4, -0.4, 0.8, -0.8, 1.25, -1.25, 1.75, -1.75, 2.25, -2.25):
             ang = base_ang + off
             ca, sa = math.cos(ang), math.sin(ang)
-            if not self.is_blocked_body(x + ca * 5.0, y + sa * 5.0, z) and not self.is_blocked_body(x + ca * 9.0, y + sa * 9.0, z):
+            if not self.is_blocked_body(x + ca * 4.8, y + sa * 4.8, z) and not self.is_blocked_body(x + ca * 9.0, y + sa * 9.0, z):
                 return ca, sa
         return desired_dx / mag, desired_dy / mag
 
@@ -208,7 +218,7 @@ class ArenaMap:
 
 
 class Bot:
-    name = "ApexMech-v22.0"
+    name = "ApexMech-v23.1"
 
     def __init__(self, hello: mf.Hello):
         self.slot = hello["slot"]
@@ -216,6 +226,10 @@ class Bot:
         self.config = hello["config"]
         self.map = ArenaMap(hello["map"]["dir"])
         self.pickup_r = self.config.get("loot", {}).get("pickup_radius", 4.0)
+        vis = self.config.get("vision", {})
+        self.fov_half = math.radians(float(vis.get("fov_deg", 120.0))) * 0.5
+        self.vis_range = float(vis.get("range", 200.0))
+        self.near_r = float(vis.get("near_range", 45.0))
 
         self.weapon_rank = {"lightning": 5, "gun": 4, "laser": 3, "mortar": 1}
         self.upgrade_weights = {
@@ -225,7 +239,7 @@ class Bot:
             "gun_rate": 95,
             "gun_damage": 94,
             "speed": 92,
-            "regen": 89,
+            "regen": 91,
             "reload": 88,
             "boost": 85,
             "energy": 83,
@@ -241,13 +255,17 @@ class Bot:
         self.strafe_period = 7
         self.last_damage_bearing = None
         self.last_damage_t = -10.0
+        self.last_hit_t = -10.0
         self.roam_target = None
 
         self.mode = "fight"
         self.evade_until = 0.0
         self.prev_evade_dir = None
+        self.heal = False
+        self.heal_since = 0.0
         self._last_log = -9.0
 
+    # ------------------------------------------------------------------ helpers
     def pick_upgrade(self, offer) -> int:
         best_i, best_score = 0, -1e9
         for i, ch in enumerate(offer.get("choices", [])):
@@ -291,6 +309,43 @@ class Bot:
             return 0.78
         return clamp(math.atan((v2 - math.sqrt(disc)) / (gravity * r)), -0.5, 1.3)
 
+    def enemy_sees_me(self, e, pos) -> bool:
+        """Vision model: LOS, and within near_range OR inside their yaw wedge <= range."""
+        ep = e["pos"]
+        d = dist2d(pos, ep)
+        if d > self.vis_range:
+            return False
+        if not self.map.has_los((ep[0], ep[1], ep[2] + 8.0), (pos[0], pos[1], pos[2] + 4.5), max_steps=10):
+            return False
+        if d <= self.near_r:
+            return True
+        yaw = e.get("aim", [0.0, 0.0])[0]
+        bearing = math.atan2(pos[1] - ep[1], pos[0] - ep[0])
+        return abs(angle_diff(bearing, yaw)) <= self.fov_half
+
+    def laser_dodge(self, pos, enemies):
+        """If an enemy is charging a laser along a line through us, step sideways off that line."""
+        for e in enemies:
+            if not e.get("charging"):
+                continue
+            ep = e["pos"]
+            d = dist2d(pos, ep)
+            if d > 285.0 or d < 3.0:
+                continue
+            yaw = e.get("aim", [0.0, 0.0])[0]
+            dx, dy = math.cos(yaw), math.sin(yaw)
+            rx, ry = pos[0] - ep[0], pos[1] - ep[1]
+            if rx * dx + ry * dy <= 0.0:
+                continue
+            lat = -rx * dy + ry * dx
+            if abs(lat) < 7.0:
+                sgn = 1.0 if lat >= 0.0 else -1.0
+                if abs(lat) < 0.3:
+                    sgn = self.strafe_dir
+                return (-dy * sgn, dx * sgn)
+        return None
+
+    # --------------------------------------------------------------------- act
     def act(self, obs: mf.Observation) -> mf.Action:
         t = obs["t"]
         me = obs["self"]
@@ -308,6 +363,8 @@ class Bot:
         for ev in obs.get("events", []):
             if ev.get("type") == "damaged":
                 took_hit = True
+                if ev.get("weapon") != "zone":
+                    self.last_hit_t = t
                 if ev.get("bearing") is not None:
                     self.last_damage_bearing = ev["bearing"]
                     self.last_damage_t = t
@@ -322,7 +379,7 @@ class Bot:
         if self.strafe_timer >= self.strafe_period or (took_hit and self.strafe_timer >= 3):
             self.strafe_timer = 0
             self.strafe_dir = -self.strafe_dir
-            self.strafe_period = self.rng.randint(6, 9)
+            self.strafe_period = self.rng.randint(STRAFE_PERIOD[0], STRAFE_PERIOD[1])
 
         action: mf.Action = {
             "tick": obs["tick"],
@@ -344,6 +401,8 @@ class Bot:
         empty_slot = 0 if weapons[0] is None else (1 if weapons[1] is None else None)
         for p in obs.get("pickups", []):
             if p["kind"] in held_kinds:
+                continue
+            if AVOID_MORTAR and p["kind"] == "mortar":
                 continue
             if dist2d(pos, p["pos"]) <= self.pickup_r - 0.15 and abs(pos[2] - p["pos"][2]) <= 3.8:
                 if empty_slot is not None:
@@ -415,9 +474,14 @@ class Bot:
                 if c_los or target is None:
                     target, target_type, target_los = c, "crate", c_los
 
-        # 4b. Fight / evade decision
+        # 4b. Situation assessment
         n_close = sum(1 for e in enemies if dist2d(pos, e["pos"]) < 80.0)
         n_seen = sum(1 for e in enemies if dist2d(pos, e["pos"]) < 130.0)
+        nearest_d = dist2d(pos, enemies[0]["pos"]) if enemies else 1e9
+        recent_hit = (t - self.last_hit_t) < 1.5
+        t_dist = dist2d(pos, target["pos"]) if target_type == "mech" else 0.0
+
+        # Fight / evade decision (3+ close)
         if EVADE_ENABLED:
             want_evade = n_close >= 3 or n_seen >= 4 or (hp_frac < 0.40 and n_close >= 2)
             if want_evade:
@@ -426,7 +490,30 @@ class Bot:
             elif self.mode == "evade" and t > self.evade_until:
                 self.mode = "fight"
         threats = [e for e in enemies if dist2d(pos, e["pos"]) < 170.0]
-        t_dist = dist2d(pos, target["pos"]) if target_type == "mech" else 0.0
+        evading = EVADE_ENABLED and self.mode == "evade" and bool(threats)
+
+        # Fixed Heal / hide decision: no cowardly `outgunned` trigger, exits at 0.75 HP
+        exposed = False
+        if HEAL_HIDE:
+            if self.heal:
+                if hp_frac >= HEAL_EXIT_FRAC or (t - self.heal_since) > 20.0:
+                    self.heal = False
+            else:
+                finishing = (
+                    target_type == "mech"
+                    and n_close <= 1
+                    and target.get("hp", 1e9) < 280.0
+                    and t_dist < 48.0
+                    and hp_frac > 0.22
+                )
+                if (not finishing) and (hp_frac < HEAL_ENTER_FRAC) and (nearest_d < 120.0 or recent_hit):
+                    self.heal = True
+                    self.heal_since = t
+            if self.heal:
+                for e in enemies[:4]:
+                    if self.enemy_sees_me(e, pos):
+                        exposed = True
+                        break
 
         engage_mech = target_type == "mech"
         if engage_mech and NO_CHASE and t_dist > CHASE_MAX:
@@ -438,16 +525,21 @@ class Bot:
         move_x, move_y = 0.0, 0.0
         want_boost = False
         pre_checked = False
+        hold_still = False
 
         d_zone = dist2d(pos, zc)
         outside_next = d_zone > max(zr - 18.0, 5.0)
         urgent_zone = (not me["in_zone"]) or (d_zone > zr - 8.0 and t > zone["shrink_start"] - 12.0)
-        evading = EVADE_ENABLED and self.mode == "evade" and bool(threats)
 
+        # Always allow scooping close cubes (<20m) even while healing (instant free HP)
         close_cube = None
         if cubes and not evading:
             c = min(cubes, key=lambda x: dist2d(pos, x["pos"]))
-            if dist2d(pos, c["pos"]) < (28.0 if near_enemies else 110.0):
+            cd = dist2d(pos, c["pos"])
+            if self.heal:
+                if cd < 20.0:
+                    close_cube = c
+            elif cd < (28.0 if near_enemies else 110.0):
                 close_cube = c
 
         best_drop = None
@@ -462,6 +554,35 @@ class Bot:
         if urgent_zone:
             move_x, move_y = zc[0] - pos[0], zc[1] - pos[1]
             want_boost = energy > 22.0
+        elif close_cube is not None:
+            move_x, move_y = close_cube["pos"][0] - pos[0], close_cube["pos"][1] - pos[1]
+            want_boost = energy > 38.0 and dist2d(pos, close_cube["pos"]) > 12.0
+        elif self.heal:
+            if exposed or recent_hit or nearest_d < 45.0:
+                if threats or enemies:
+                    th = threats if threats else enemies
+                    d_ev = self.map.evade_direction(pos, muzzle_h, th, zc, zr, self.prev_evade_dir)
+                    if d_ev is None:
+                        cx = sum(e["pos"][0] for e in th) / len(th)
+                        cy = sum(e["pos"][1] for e in th) / len(th)
+                        move_x, move_y = pos[0] - cx, pos[1] - cy
+                    else:
+                        move_x, move_y = d_ev
+                        self.prev_evade_dir = d_ev
+                        pre_checked = True
+                elif self.last_damage_bearing is not None:
+                    move_x = -math.cos(self.last_damage_bearing)
+                    move_y = -math.sin(self.last_damage_bearing)
+                want_boost = energy > 20.0 and (recent_hit or exposed)
+            elif best_drop is not None:
+                dd = dist2d(pos, best_drop["pos"])
+                if DROP_HOLD and dd < 3.0:
+                    hold_still = True
+                else:
+                    move_x, move_y = best_drop["pos"][0] - pos[0], best_drop["pos"][1] - pos[1]
+                    want_boost = energy > 35.0 and dd > best_drop["radius"]
+            else:
+                hold_still = True  # hidden: stand still (silent) and regenerate
         elif evading:
             d_ev = self.map.evade_direction(pos, muzzle_h, threats, zc, zr, self.prev_evade_dir)
             if d_ev is None:
@@ -473,12 +594,13 @@ class Bot:
                 self.prev_evade_dir = d_ev
                 pre_checked = True
             want_boost = energy > 20.0 and (took_hit or n_close >= 3)
-        elif close_cube is not None:
-            move_x, move_y = close_cube["pos"][0] - pos[0], close_cube["pos"][1] - pos[1]
-            want_boost = energy > 38.0 and dist2d(pos, close_cube["pos"]) > 12.0
         elif best_drop is not None and (not near_enemies or hp_frac < 0.60):
-            move_x, move_y = best_drop["pos"][0] - pos[0], best_drop["pos"][1] - pos[1]
-            want_boost = energy > 35.0 and dist2d(pos, best_drop["pos"]) > best_drop["radius"]
+            dd = dist2d(pos, best_drop["pos"])
+            if DROP_HOLD and dd < 3.0:
+                pass
+            else:
+                move_x, move_y = best_drop["pos"][0] - pos[0], best_drop["pos"][1] - pos[1]
+                want_boost = energy > 35.0 and dd > best_drop["radius"]
         elif engage_mech:
             ex, ey = target["pos"][0], target["pos"][1]
             dx, dy = ex - pos[0], ey - pos[1]
@@ -540,7 +662,13 @@ class Bot:
                 want_boost = energy > 15.0
         elif (empty_slot is not None or not has_lightning) and pickups:
             lp = [p for p in pickups if p["kind"] == "lightning"]
-            valid_p = lp if (lp and not has_lightning) else [p for p in pickups if p["kind"] not in held_kinds]
+            if lp and not has_lightning:
+                valid_p = lp
+            else:
+                valid_p = [
+                    p for p in pickups
+                    if p["kind"] not in held_kinds and not (AVOID_MORTAR and p["kind"] == "mortar")
+                ]
             if valid_p:
                 p = min(valid_p, key=lambda x: dist2d(pos, x["pos"]))
                 move_x, move_y = p["pos"][0] - pos[0], p["pos"][1] - pos[1]
@@ -563,13 +691,23 @@ class Bot:
                 )
             move_x, move_y = self.roam_target[0] - pos[0], self.roam_target[1] - pos[1]
 
+        # Laser dodge overrides movement
+        if LASER_DODGE:
+            ld = self.laser_dodge(pos, enemies)
+            if ld is not None:
+                move_x, move_y = ld
+                pre_checked = False
+                hold_still = False
+                if energy > 25.0:
+                    want_boost = True
+
         if pre_checked:
             mx, my = move_x, move_y
         else:
             mx, my = self.map.steer_around_walls(pos, move_x, move_y)
         action["move"] = [mx, my]
         action["boost"] = want_boost
-        if self.stuck_ticks >= 4:
+        if self.stuck_ticks >= 4 and not hold_still:
             if me["grounded"]:
                 action["jump"] = True
             elif energy > 25.0:
@@ -580,7 +718,10 @@ class Bot:
                 self.prev_evade_dir = None
                 self.stuck_ticks = 0
 
-        # 6. Aiming & firing (always shoots, even while evading)
+        # 6. Aiming & firing
+        # Hold fire while healing unless an enemy is point-blank (<35m)
+        suppress_fire = self.heal and nearest_d >= 35.0
+
         if target is not None:
             tpos = target["pos"]
             tvel = target.get("vel", [0.0, 0.0, 0.0])
@@ -598,52 +739,67 @@ class Bot:
             yaw_err = abs(angle_diff(des_yaw, cur_yaw))
 
             fire_flags = [False, False]
-            for s_idx, w in enumerate(weapons):
-                if w is None:
-                    continue
-                kind = w["kind"]
-                wstats = w.get("stats", {})
+            if not suppress_fire:
+                for s_idx, w in enumerate(weapons):
+                    if w is None:
+                        continue
+                    kind = w["kind"]
+                    wstats = w.get("stats", {})
 
-                if kind == "lightning":
-                    min_energy = 5.0
-                    if LIGHTNING_RESERVE:
-                        finishing = target_type == "mech" and target.get("hp", 1000.0) < 150.0
-                        min_energy = 5.0 if finishing else 22.0
-                    if target_los and d_target <= wstats.get("range", 45.0) - 1.0 and yaw_err < 0.48 and energy > min_energy:
-                        fire_flags[s_idx] = True
+                    if kind == "lightning":
+                        min_energy = 5.0
+                        if LIGHTNING_RESERVE:
+                            finishing_k = target_type == "mech" and target.get("hp", 1000.0) < 150.0
+                            min_energy = 5.0 if finishing_k else 22.0
+                        if target_los and d_target <= wstats.get("range", 45.0) - 1.0 and yaw_err < 0.48 and energy > min_energy:
+                            fire_flags[s_idx] = True
 
-                elif kind == "gun":
-                    if target_los and d_target <= wstats.get("range", 230.0) and yaw_err < 0.15 and w.get("reload", 0.0) <= 0.0:
-                        fire_flags[s_idx] = True
+                    elif kind == "gun":
+                        if target_los and d_target <= wstats.get("range", 230.0) and yaw_err < 0.15 and w.get("reload", 0.0) <= 0.0:
+                            fire_flags[s_idx] = True
 
-                elif kind == "laser":
-                    charge = w.get("charge", 0.0)
-                    full_charge = wstats.get("charge", 0.75)
-                    min_charge = wstats.get("min_charge", 0.15)
-                    if target_type == "mech" and target_los and d_target <= wstats.get("range", 280.0):
-                        des_yaw, des_pitch = self.aim_at_point(muzzle_pos, aim_center)
-                        yaw_err = abs(angle_diff(des_yaw, cur_yaw))
-                        if charge == 0.0:
-                            if w.get("cooldown", 0.0) <= 0.0 and yaw_err < 0.45:
+                    elif kind == "laser":
+                        charge = w.get("charge", 0.0)
+                        full_charge = wstats.get("charge", 0.75)
+                        min_charge = wstats.get("min_charge", 0.15)
+                        if target_type == "mech" and target_los and d_target <= wstats.get("range", 280.0):
+                            des_yaw, des_pitch = self.aim_at_point(muzzle_pos, aim_center)
+                            yaw_err = abs(angle_diff(des_yaw, cur_yaw))
+                            if charge == 0.0:
+                                if w.get("cooldown", 0.0) <= 0.0 and yaw_err < 0.45:
+                                    fire_flags[s_idx] = True
+                            elif (charge >= full_charge * 0.72 and yaw_err < 0.08) or (
+                                charge >= min_charge and target.get("hp", 1000) < 160 and yaw_err < 0.09
+                            ):
+                                fire_flags[s_idx] = False
+                            else:
                                 fire_flags[s_idx] = True
-                        elif (charge >= full_charge * 0.72 and yaw_err < 0.08) or (
-                            charge >= min_charge and target.get("hp", 1000) < 160 and yaw_err < 0.09
-                        ):
-                            fire_flags[s_idx] = False
-                        else:
-                            fire_flags[s_idx] = True
 
-                elif kind == "mortar":
-                    if d_target <= 215.0 and d_target >= 18.0 and w.get("cooldown", 0.0) <= 0.0:
-                        des_pitch = self.mortar_pitch(muzzle_pos, aim_center, wstats.get("speed", 72.0), wstats.get("gravity", 22.0))
-                        if yaw_err < 0.14:
-                            fire_flags[s_idx] = True
+                    elif kind == "mortar":
+                        if d_target <= 215.0 and d_target >= 18.0 and w.get("cooldown", 0.0) <= 0.0:
+                            des_pitch = self.mortar_pitch(muzzle_pos, aim_center, wstats.get("speed", 72.0), wstats.get("gravity", 22.0))
+                            if yaw_err < 0.14:
+                                fire_flags[s_idx] = True
+
+            if suppress_fire or hold_still:
+                fire_flags = [False, False]
+                for w in weapons:
+                    if w and w["kind"] == "gun" and w.get("reload", 0.0) <= 0.0:
+                        if w.get("ammo", 12) < w["stats"].get("mag", 12):
+                            action["reload"] = True
+            elif not target_los:
+                for w in weapons:
+                    if w and w["kind"] == "gun" and w.get("reload", 0.0) <= 0.0:
+                        if w.get("ammo", 12) < w["stats"].get("mag", 12) * 0.55:
+                            action["reload"] = True
 
             action["aim"] = [des_yaw, des_pitch]
             action["fire"] = fire_flags
         else:
             if self.last_damage_bearing is not None and (t - self.last_damage_t) < 2.5:
                 action["aim"] = [self.last_damage_bearing, 0.0]
+            elif hold_still:
+                action["aim"] = [cur_yaw, 0.0]
             elif obs.get("sounds"):
                 near_sounds = [s for s in obs["sounds"] if s["dist"] in ("near", "mid")]
                 if near_sounds:
@@ -654,16 +810,18 @@ class Bot:
             for w in weapons:
                 if w and w["kind"] == "gun" and w.get("reload", 0.0) <= 0.0:
                     mag = w["stats"].get("mag", 12)
-                    if w.get("ammo", mag) < mag * 0.65:
+                    thresh = 1.0 if (suppress_fire or hold_still) else 0.65
+                    if w.get("ammo", mag) < mag * thresh:
                         action["reload"] = True
 
         # 7. Logging for death analysis
-        if LOGGING and (took_hit or n_close > 0) and t - self._last_log > 1.0:
+        if LOGGING and (took_hit or n_close > 0 or self.heal) and t - self._last_log > 1.0:
             self._last_log = t
             try:
                 mf.log(
-                    f"t={t:.0f} hp={hp_frac:.2f} mode={self.mode} close={n_close} seen={n_seen} "
-                    f"en={energy:.0f} inzone={int(me['in_zone'])} dz={d_zone:.0f}/{zr:.0f} cubes={my_cubes}"
+                    f"t={t:.0f} alive={obs.get('alive')} hp={hp_frac:.2f} mode={self.mode} heal={int(self.heal)} "
+                    f"hold={int(hold_still)} exp={int(exposed)} close={n_close} seen={n_seen} en={energy:.0f} "
+                    f"inzone={int(me['in_zone'])} dz={d_zone:.0f}/{zr:.0f} cubes={my_cubes}"
                 )
             except Exception:
                 pass
