@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-ApexMech v17.0 - Hyper-Aggressive Assassin (Built directly on V11.0's 4.33 base)
-- Keeps V11.0's exact map, aiming, and cube snowball intact
-- Tighter 25m Lightning orbit + lower 22% retreat threshold
-- Aggressive boost-chasing & blind-spot flanking (energy > 30)
-- Stays in Lightning chain range during 1v2s when healthy + low-HP execute focus
-Standard library only. (<2ms/tick)
+ApexMech v18.0 - Low-Latency 1v1 Isolator & Strafe Assassin
+Built on V11 (4.33) / V17 (4.23):
+- Ultra-fast <1ms/tick LOS & wall steering (zero skipped ticks)
+- 1v1 isolation: strafes around primary target away from secondary enemies
+- Full-speed strafe-shooting + 1.5x rear-armor blind-spot flanking
+Standard library only.
 """
 import json
 import math
@@ -55,7 +55,7 @@ class ArenaMap:
     def __init__(self, map_dir: str):
         self.cell_size = 45.0
         self.grid: dict[tuple[int, int], list[int]] = {}
-        self.prisms: list[dict] = []
+        self.prisms: list[tuple] = []
         self.bounds = (-508.0, 551.0, -329.0, 384.0)
 
         world_path = os.path.join(map_dir, "v2", "world.json")
@@ -79,73 +79,76 @@ class ArenaMap:
                     ys = ring[1::2]
                     minx, maxx = min(xs), max(xs)
                     miny, maxy = min(ys), max(ys)
-                    prism = {
-                        "base": float(p.get("base", -100.0)),
-                        "top": float(p.get("top", 100.0)),
-                        "ring": ring,
-                        "holes": p.get("holes", []),
-                        "bbox": (minx, miny, maxx, maxy),
-                    }
+                    # Store as flat tuple for faster inner-loop access
+                    prism = (
+                        float(p.get("base", -100.0)),
+                        float(p.get("top", 100.0)),
+                        minx,
+                        miny,
+                        maxx,
+                        maxy,
+                        ring,
+                        p.get("holes", []),
+                    )
                     idx = len(self.prisms)
                     self.prisms.append(prism)
-                    for cx in range(int(math.floor(minx / self.cell_size)), int(math.floor(maxx / self.cell_size)) + 1):
-                        for cy in range(int(math.floor(miny / self.cell_size)), int(math.floor(maxy / self.cell_size)) + 1):
+                    cs = self.cell_size
+                    for cx in range(int(math.floor(minx / cs)), int(math.floor(maxx / cs)) + 1):
+                        for cy in range(int(math.floor(miny / cs)), int(math.floor(maxy / cs)) + 1):
                             self.grid.setdefault((cx, cy), []).append(idx)
             except Exception as e:
                 mf.log(f"[map] load error: {e}")
 
     def point_in_prism(self, x: float, y: float, z: float) -> bool:
-        cand = self.grid.get((int(math.floor(x / self.cell_size)), int(math.floor(y / self.cell_size))))
+        cand = self.grid.get((int(math.floor(x / 45.0)), int(math.floor(y / 45.0))))
         if not cand:
             return False
+        prisms = self.prisms
         for idx in cand:
-            p = self.prisms[idx]
-            if z < p["base"] or z > p["top"]:
+            base, top, minx, miny, maxx, maxy, ring, holes = prisms[idx]
+            if z < base or z > top or x < minx or x > maxx or y < miny or y > maxy:
                 continue
-            minx, miny, maxx, maxy = p["bbox"]
-            if x < minx or x > maxx or y < miny or y > maxy:
-                continue
-            if point_in_ring(x, y, p["ring"]):
-                if not any(point_in_ring(x, y, h) for h in p["holes"]):
+            if point_in_ring(x, y, ring):
+                if not holes or not any(point_in_ring(x, y, h) for h in holes):
                     return True
         return False
 
-    def is_blocked_body(self, x: float, y: float, z_feet: float, height: float = 9.0) -> bool:
-        if x < self.bounds[0] or x > self.bounds[1] or y < self.bounds[2] or y > self.bounds[3]:
+    def is_blocked_body(self, x: float, y: float, z_feet: float) -> bool:
+        b = self.bounds
+        if x < b[0] or x > b[1] or y < b[2] or y > b[3]:
             return True
-        cand = self.grid.get((int(math.floor(x / self.cell_size)), int(math.floor(y / self.cell_size))))
+        cand = self.grid.get((int(math.floor(x / 45.0)), int(math.floor(y / 45.0))))
         if not cand:
             return False
-        z_top = z_feet + height
+        z_top = z_feet + 9.0
+        prisms = self.prisms
         for idx in cand:
-            p = self.prisms[idx]
-            if z_top <= p["base"] or z_feet >= p["top"] - 1.2:
+            base, top, minx, miny, maxx, maxy, ring, holes = prisms[idx]
+            if z_top <= base or z_feet >= top - 1.2 or x < minx or x > maxx or y < miny or y > maxy:
                 continue
-            minx, miny, maxx, maxy = p["bbox"]
-            if x < minx or x > maxx or y < miny or y > maxy:
-                continue
-            if point_in_ring(x, y, p["ring"]):
-                if not any(point_in_ring(x, y, h) for h in p["holes"]):
+            if point_in_ring(x, y, ring):
+                if not holes or not any(point_in_ring(x, y, h) for h in holes):
                     return True
         return False
 
     def has_los(self, a, b) -> bool:
-        d = dist3d(a, b)
-        if d < 5.0:
+        dx = b[0] - a[0]
+        dy = b[1] - a[1]
+        dz = b[2] - a[2]
+        d = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if d < 6.0:
             return True
-        steps = min(int(d / 7.0), 20)
+        steps = min(int(d / 10.0), 12)
         if steps < 2:
             return True
-        dx = (b[0] - a[0]) / steps
-        dy = (b[1] - a[1]) / steps
-        dz = (b[2] - a[2]) / steps
-        x, y, z = a[0] + dx, a[1] + dy, a[2] + dz
+        sx, sy, sz = dx / steps, dy / steps, dz / steps
+        x, y, z = a[0] + sx, a[1] + sy, a[2] + sz
         for _ in range(1, steps):
             if self.point_in_prism(x, y, z):
                 return False
-            x += dx
-            y += dy
-            z += dz
+            x += sx
+            y += sy
+            z += sz
         return True
 
     def steer_around_walls(self, pos, desired_dx: float, desired_dy: float):
@@ -154,19 +157,16 @@ class ArenaMap:
             return 0.0, 0.0
         base_ang = math.atan2(desired_dy, desired_dx)
         x, y, z = pos[0], pos[1], pos[2]
-        for off in (0.0, 0.35, -0.35, 0.7, -0.7, 1.1, -1.1, 1.55, -1.55, 2.1, -2.1):
+        for off in (0.0, 0.4, -0.4, 0.8, -0.8, 1.25, -1.25, 1.75, -1.75, 2.25, -2.25):
             ang = base_ang + off
             ca, sa = math.cos(ang), math.sin(ang)
-            if (
-                not self.is_blocked_body(x + ca * 4.5, y + sa * 4.5, z)
-                and not self.is_blocked_body(x + ca * 9.0, y + sa * 9.0, z)
-            ):
+            if not self.is_blocked_body(x + ca * 5.0, y + sa * 5.0, z) and not self.is_blocked_body(x + ca * 9.0, y + sa * 9.0, z):
                 return ca, sa
         return desired_dx / mag, desired_dy / mag
 
 
 class Bot:
-    name = "ApexMech-v17.0"
+    name = "ApexMech-v18.0"
 
     def __init__(self, hello: mf.Hello):
         self.slot = hello["slot"]
@@ -175,21 +175,18 @@ class Bot:
         self.map = ArenaMap(hello["map"]["dir"])
         self.pickup_r = self.config.get("loot", {}).get("pickup_radius", 4.0)
 
-        # Lock in Gun + Lightning (360 DPS Lightning + 281 DPS Gun on rear armor!)
         self.weapon_rank = {"lightning": 5, "gun": 4, "laser": 3, "mortar": 1}
-
-        # Hyper-aggressive DPS + Armor/HP upgrades
         self.upgrade_weights = {
             "armor": 100,
             "lightning": 98,
             "hp": 97,
-            "gun_rate": 96,
-            "gun_damage": 95,
+            "gun_rate": 95,
+            "gun_damage": 94,
             "speed": 92,
-            "reload": 89,
-            "regen": 88,
-            "boost": 86,
-            "energy": 84,
+            "regen": 89,
+            "reload": 88,
+            "boost": 85,
+            "energy": 83,
             "laser": 80,
             "sensors": 62,
             "mortar": 35,
@@ -199,7 +196,7 @@ class Bot:
         self.stuck_ticks = 0
         self.strafe_dir = 1.0
         self.strafe_timer = 0
-        self.strafe_period = 8
+        self.strafe_period = 7
         self.last_damage_bearing = None
         self.last_damage_t = -10.0
         self.roam_target = None
@@ -259,10 +256,13 @@ class Bot:
         muzzle_pos = (pos[0], pos[1], pos[2] + stats.get("muzzle_height", 7.0))
         cur_yaw, _ = me["aim"]
 
+        took_hit = False
         for ev in obs.get("events", []):
-            if ev.get("type") == "damaged" and ev.get("bearing") is not None:
-                self.last_damage_bearing = ev["bearing"]
-                self.last_damage_t = t
+            if ev.get("type") == "damaged":
+                took_hit = True
+                if ev.get("bearing") is not None:
+                    self.last_damage_bearing = ev["bearing"]
+                    self.last_damage_t = t
 
         if self.last_pos is not None and dist2d(pos, self.last_pos) < 0.25:
             self.stuck_ticks += 1
@@ -270,11 +270,12 @@ class Bot:
             self.stuck_ticks = 0
         self.last_pos = pos
 
+        # Flip strafe direction on timer or when taking damage to break enemy aim lead
         self.strafe_timer += 1
-        if self.strafe_timer >= self.strafe_period:
+        if self.strafe_timer >= self.strafe_period or (took_hit and self.strafe_timer >= 3):
             self.strafe_timer = 0
             self.strafe_dir = -self.strafe_dir
-            self.strafe_period = self.rng.randint(7, 11)
+            self.strafe_period = self.rng.randint(6, 9)
 
         action: mf.Action = {
             "tick": obs["tick"],
@@ -326,7 +327,7 @@ class Bot:
         zc = zone["next_center"]
         zr = zone["next_radius"]
 
-        # 4. Aggressive Assassin Target Selection (1.5x Backstab + Execute Focus)
+        # 4. Fast Target Selection (only raycast top 3 closest enemies)
         enemies.sort(key=lambda e: dist2d(pos, e["pos"]))
         near_enemies = [e for e in enemies if dist2d(pos, e["pos"]) < 85.0]
         target = None
@@ -335,7 +336,7 @@ class Bot:
 
         if enemies:
             scored = []
-            for e in enemies[:4]:
+            for e in enemies[:3]:
                 ep = e["pos"]
                 d = dist2d(pos, ep)
                 los = self.map.has_los(muzzle_pos, (ep[0], ep[1], ep[2] + 4.5))
@@ -343,17 +344,15 @@ class Bot:
                 hp_w = 0.42 + 0.58 * (hp / max(e.get("max_hp", 1400.0), 1.0))
 
                 e_yaw = e.get("aim", [0.0, 0.0])[0]
-                ang_e_to_me = math.atan2(pos[1] - ep[1], pos[0] - ep[0])
-                back_err = abs(angle_diff(ang_e_to_me, e_yaw))
-                backstab_bonus = -32.0 if (los and back_err > 1.45) else 0.0
-                exec_bonus = -35.0 if (los and hp < 350.0) else 0.0
+                back_err = abs(angle_diff(math.atan2(pos[1] - ep[1], pos[0] - ep[0]), e_yaw))
+                backstab_bonus = -30.0 if (los and back_err > 1.45) else 0.0
+                exec_bonus = -32.0 if (los and hp < 350.0) else 0.0
 
                 scored.append((d * hp_w + backstab_bonus + exec_bonus + (0.0 if los else 130.0), los, e))
             scored.sort(key=lambda x: x[0])
             _, target_los, target = scored[0]
             target_type = "mech"
 
-        # Farm NPCs/crates when no close enemy (<65m) and we want cubes/upgrades
         if (target is None or (my_cubes < 15 and dist2d(pos, target["pos"]) > 65.0)) and npcs:
             n = min(npcs, key=lambda x: dist2d(pos, x["pos"]))
             if dist2d(pos, n["pos"]) < 95.0:
@@ -367,7 +366,7 @@ class Bot:
                 if c_los or target is None:
                     target, target_type, target_los = c, "crate", c_los
 
-        # 5. Movement Decision (Hyper-Aggressive Blind-Spot Flanking + Chain-Range Kiting)
+        # 5. Movement: 1v1 Isolation + Full-Speed Strafe-Shooting
         move_x, move_y = 0.0, 0.0
         want_boost = False
 
@@ -394,62 +393,66 @@ class Bot:
             want_boost = energy > 22.0
         elif close_cube is not None:
             move_x, move_y = close_cube["pos"][0] - pos[0], close_cube["pos"][1] - pos[1]
-            want_boost = energy > 35.0 and dist2d(pos, close_cube["pos"]) > 12.0
+            want_boost = energy > 38.0 and dist2d(pos, close_cube["pos"]) > 12.0
         elif best_drop is not None and (not near_enemies or hp_frac < 0.60):
             move_x, move_y = best_drop["pos"][0] - pos[0], best_drop["pos"][1] - pos[1]
             want_boost = energy > 35.0 and dist2d(pos, best_drop["pos"]) > best_drop["radius"]
         elif target_type == "mech":
-            if len(near_enemies) >= 2 and not (len(near_enemies) == 2 and has_lightning and hp_frac > 0.38):
-                # Multi-bot kite when low HP or 3+ bots
-                cx = sum(e["pos"][0] for e in near_enemies) / len(near_enemies)
-                cy = sum(e["pos"][1] for e in near_enemies) / len(near_enemies)
-                dx, dy = pos[0] - cx, pos[1] - cy
-                d = max(math.hypot(dx, dy), 1e-4)
-                nx, ny = dx / d, dy / d
-                sx, sy = -ny * self.strafe_dir, nx * self.strafe_dir
+            ex, ey = target["pos"][0], target["pos"][1]
+            dx, dy = ex - pos[0], ey - pos[1]
+            d = max(math.hypot(dx, dy), 1e-4)
+            nx, ny = dx / d, dy / d
+
+            if len(near_enemies) >= 2:
+                # 1v1 ISOLATION: Strafe around primary target AWAY from secondary enemies!
+                others = [e for e in near_enemies if e is not target]
+                ox = sum(e["pos"][0] for e in others) / len(others)
+                oy = sum(e["pos"][1] for e in others) / len(others)
+                ax, ay = pos[0] - ox, pos[1] - oy
+                am = max(math.hypot(ax, ay), 1e-4)
+                ax, ay = ax / am, ay / am
+
+                # Pick the lateral strafe around target that moves farther from secondary enemies
+                s1x, s1y = -ny, nx
+                s2x, s2y = ny, -nx
+                if (s1x * ax + s1y * ay) >= (s2x * ax + s2y * ay):
+                    sx, sy = s1x, s1y
+                else:
+                    sx, sy = s2x, s2y
+
+                # Blend away-from-secondary + lateral strafe + slight zone pull
                 zx, zy = zc[0] - pos[0], zc[1] - pos[1]
                 zm = max(math.hypot(zx, zy), 1e-4)
-                move_x = nx * 0.70 + sx * 0.60 + (zx / zm) * 0.25
-                move_y = ny * 0.70 + sy * 0.60 + (zy / zm) * 0.25
-                want_boost = energy > 28.0 and dist2d(pos, near_enemies[0]["pos"]) < 38.0
+                move_x = sx * 0.60 + ax * 0.55 + (zx / zm) * 0.15
+                move_y = sy * 0.60 + ay * 0.55 + (zy / zm) * 0.15
+                want_boost = energy > 30.0 and dist2d(pos, others[0]["pos"]) < 45.0
             else:
-                # HYPER-AGGRESSIVE ASSASSIN ORBIT (also used in healthy 1v2s to chain Lightning!)
-                ex, ey = target["pos"][0], target["pos"][1]
-                dx, dy = ex - pos[0], ey - pos[1]
-                d = max(math.hypot(dx, dy), 1e-4)
-                nx, ny = dx / d, dy / d
-
+                # 1v1 FULL-SPEED STRAFE-SHOOT + BLIND-SPOT FLANKING
                 e_yaw = target.get("aim", [0.0, 0.0])[0]
-                ang_e_to_me = math.atan2(pos[1] - ey, pos[0] - ex)
-                rel = angle_diff(ang_e_to_me, e_yaw)
+                rel = angle_diff(math.atan2(pos[1] - ey, pos[0] - ex), e_yaw)
                 flank_dir = -1.0 if rel >= 0.0 else 1.0
                 sx, sy = -ny * flank_dir, nx * flank_dir
 
-                ideal_dist = 25.0 if (has_lightning and hp_frac > 0.25) else 52.0
-                if len(near_enemies) == 2:
-                    ideal_dist = 33.0  # Stay right in Lightning chain sweet spot
-
-                if hp_frac < 0.22:
-                    move_x = -nx * 0.80 + sx * 0.60
-                    move_y = -ny * 0.80 + sy * 0.60
-                    want_boost = energy > 22.0
-                elif d > ideal_dist + 7.0:
-                    move_x = nx * 0.70 + sx * 0.72
-                    move_y = ny * 0.70 + sy * 0.72
-                    want_boost = has_lightning and d < 72.0 and energy > 30.0
-                elif d < ideal_dist - 7.0:
-                    move_x = -nx * 0.50 + sx * 0.86
-                    move_y = -ny * 0.50 + sy * 0.86
+                ideal_dist = 27.0 if (has_lightning and hp_frac > 0.30) else 58.0
+                if hp_frac < 0.26:
+                    move_x = -nx * 0.72 + sx * 0.70
+                    move_y = -ny * 0.72 + sy * 0.70
+                    want_boost = energy > 24.0
+                elif d > ideal_dist + 8.0:
+                    # Keep strong lateral strafe (0.82) even while closing in
+                    move_x = nx * 0.57 + sx * 0.82
+                    move_y = ny * 0.57 + sy * 0.82
+                    want_boost = has_lightning and d < 64.0 and energy > 36.0
+                elif d < ideal_dist - 8.0:
+                    move_x = -nx * 0.52 + sx * 0.85
+                    move_y = -ny * 0.52 + sy * 0.85
                 else:
                     move_x, move_y = sx, sy
-                    if has_lightning and d < 38.0 and 0.65 < abs(rel) < 1.95 and energy > 30.0:
+                    if has_lightning and d < 36.0 and 0.65 < abs(rel) < 1.90 and energy > 35.0:
                         want_boost = True
 
             if target.get("charging"):
-                ex, ey = target["pos"][0], target["pos"][1]
-                dx, dy = ex - pos[0], ey - pos[1]
-                d = max(math.hypot(dx, dy), 1e-4)
-                move_x, move_y = (-dy / d) * self.strafe_dir, (dx / d) * self.strafe_dir
+                move_x, move_y = (-ny) * self.strafe_dir, nx * self.strafe_dir
                 want_boost = energy > 15.0
         elif (empty_slot is not None or not has_lightning) and pickups:
             lp = [p for p in pickups if p["kind"] == "lightning"]
@@ -457,7 +460,7 @@ class Bot:
             if valid_p:
                 p = min(valid_p, key=lambda x: dist2d(pos, x["pos"]))
                 move_x, move_y = p["pos"][0] - pos[0], p["pos"][1] - pos[1]
-                want_boost = energy > 40.0
+                want_boost = energy > 45.0
         elif target_type in ("npc", "crate"):
             dx, dy = target["pos"][0] - pos[0], target["pos"][1] - pos[1]
             if math.hypot(dx, dy) > 26.0:
@@ -477,7 +480,7 @@ class Bot:
             move_x, move_y = self.roam_target[0] - pos[0], self.roam_target[1] - pos[1]
 
         mx, my = self.map.steer_around_walls(pos, move_x, move_y)
-        action["move"] = [round(mx, 4), round(my, 4)]
+        action["move"] = [mx, my]
         action["boost"] = want_boost
         if self.stuck_ticks >= 4:
             if me["grounded"]:
@@ -544,17 +547,17 @@ class Bot:
                         if yaw_err < 0.14:
                             fire_flags[s_idx] = True
 
-            action["aim"] = [round(des_yaw, 4), round(des_pitch, 4)]
+            action["aim"] = [des_yaw, des_pitch]
             action["fire"] = fire_flags
         else:
             if self.last_damage_bearing is not None and (t - self.last_damage_t) < 2.5:
-                action["aim"] = [round(self.last_damage_bearing, 4), 0.0]
+                action["aim"] = [self.last_damage_bearing, 0.0]
             elif obs.get("sounds"):
                 near_sounds = [s for s in obs["sounds"] if s["dist"] in ("near", "mid")]
                 if near_sounds:
-                    action["aim"] = [round(near_sounds[0]["bearing"], 4), 0.0]
+                    action["aim"] = [near_sounds[0]["bearing"], 0.0]
             else:
-                action["aim"] = [round(wrap_angle(cur_yaw + 0.35), 4), 0.0]
+                action["aim"] = [wrap_angle(cur_yaw + 0.35), 0.0]
 
             for w in weapons:
                 if w and w["kind"] == "gun" and w.get("reload", 0.0) <= 0.0:
